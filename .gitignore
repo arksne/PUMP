@@ -1,0 +1,7 @@
+/target
+/data
+/music
+/dist
+.env
+__pycache__/
+/.venv

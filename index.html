@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>PUMP</title>
+  <style>
+    :root {
+      --bg: #0b0b10;
+      --glass: rgba(255, 255, 255, 0.08);
+      --glass-active: rgba(255, 255, 255, 0.18);
+      --border-top: rgba(255, 255, 255, 0.18);
+      --text: #ffffff;
+      --muted: rgba(255, 255, 255, 0.65);
+      --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; user-select: none; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .ambient {
+      position: fixed; inset: -25%;
+      background-size: cover; background-position: center;
+      filter: blur(70px) saturate(180%) brightness(0.45);
+      z-index: 0; transition: background-image 0.6s ease;
+    }
+    .glass {
+      background: var(--glass);
+      backdrop-filter: blur(24px) saturate(180%);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      border-top: 1px solid var(--border-top);
+      border-bottom: 1px solid rgba(0,0,0,0.25);
+    }
+    .btn {
+      border: none; background: transparent; color: var(--text);
+      display: inline-flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: transform 0.2s var(--spring), background 0.2s;
+    }
+    .btn:active { transform: scale(0.88); }
+
+    .shell {
+      position: relative; z-index: 1; flex: 1;
+      display: flex; flex-direction: column;
+      width: 100%; max-width: 640px; margin-inline: auto;
+      padding: 14px 20px 84px; overflow: hidden;
+    }
+    .screen { display: none; flex: 1; flex-direction: column; overflow-y: auto; }
+    .screen.active { display: flex; }
+
+    /* Шапка плеера */
+    .top-bar { height: 44px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+    .pill-badge { padding: 6px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--muted); }
+
+    /* Обложка с 3 стилями */
+    .art-stage { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 184px; margin-top: 8px; container-type: size; }
+    .art-box {
+      width: min(calc(100% - 8px), 184px); aspect-ratio: 1;
+      position: relative; transition: all 0.45s var(--spring);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.2);
+    }
+    @supports (width: 1cqh) {
+      .art-box { width: min(calc(100% - 8px), 100cqh, 300px); }
+    }
+    .art-box.card { border-radius: 24px; }
+    .art-box.vinyl {
+      border-radius: 50%; border: 6px solid rgba(255,255,255,0.15);
+      animation: spin 16s linear infinite; animation-play-state: paused;
+    }
+    .art-box.vinyl.playing { animation-play-state: running; }
+    .art-box.vinyl::after {
+      content: ""; position: absolute; top: 50%; left: 50%;
+      width: 42px; height: 42px; transform: translate(-50%, -50%);
+      border-radius: 50%; background: #101015; border: 3px solid rgba(255,255,255,0.25);
+    }
+    .art-box.clover { border-radius: 38% 62% 38% 62% / 62% 38% 62% 38%; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .art-img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; display: block; }
+
+    /* Название и лайк */
+    .meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
+    .titles { flex: 1; min-width: 0; }
+    .title { font-size: 22px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .artist { font-size: 16px; font-weight: 500; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+    .like-btn { width: 48px; height: 48px; border-radius: 50%; font-size: 20px; color: var(--muted); }
+    .like-btn.liked { color: #fff; background: var(--glass-active); }
+
+    /* Полоса перемотки */
+    .scrubber-wrap { margin-top: 16px; }
+    input[type="range"].bar {
+      appearance: none; width: 100%; height: 24px;
+      border-radius: 9999px; background: transparent; outline: none;
+    }
+    .bar::-webkit-slider-runnable-track {
+      height: 4px; border-radius: 9999px; background: rgba(255,255,255,0.3);
+    }
+    .bar::-moz-range-track {
+      height: 4px; border-radius: 9999px; background: rgba(255,255,255,0.3);
+    }
+    .bar:active::-webkit-slider-runnable-track { height: 8px; }
+    .bar:active::-moz-range-track { height: 8px; }
+    input[type="range"].bar::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 16px; height: 16px;
+      border-radius: 50%; background: #fff; margin-top: -6px;
+    }
+    .bar:active::-webkit-slider-thumb { margin-top: -4px; }
+    .bar::-moz-range-thumb {
+      width: 16px; height: 16px; border: 0; border-radius: 50%; background: #fff;
+    }
+    .times { display: flex; justify-content: space-between; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
+
+    /* Главные кнопки */
+    .controls { display: flex; align-items: center; justify-content: space-between; margin: 14px 0; }
+    .c-sec { width: 48px; height: 48px; border-radius: 50%; color: var(--muted); font-size: 20px; }
+    .c-sec.active { color: #fff; background: var(--glass-active); }
+    .c-skip { width: 52px; height: 52px; border-radius: 50%; font-size: 28px; }
+    .c-play { width: 64px; height: 64px; border-radius: 50%; background: #fff; color: #0b0b10; font-size: 26px; font-weight: bold; }
+    .media-icon { position: relative; display: block; width: 24px; height: 24px; }
+    .media-icon::before { content: ""; position: absolute; inset: 0; background: currentColor; clip-path: polygon(13% 0, 100% 50%, 13% 100%); }
+    .c-skip .media-icon::before { right: 5px; }
+    .c-skip .media-icon::after { content: ""; position: absolute; inset: 0 0 0 auto; width: 4px; background: currentColor; border-radius: 1px; }
+    .c-skip[data-action="previous"] .media-icon { transform: scaleX(-1); }
+    .c-play.is-playing .media-icon::before { inset: 0 auto 0 4px; width: 6px; clip-path: none; border-radius: 1px; box-shadow: 10px 0 currentColor; }
+
+    /* Инструменты плеера */
+    .dock { display: flex; justify-content: space-around; padding: 6px; border-radius: 9999px; }
+    .dock-btn { height: 48px; padding: 0 8px; border-radius: 9999px; font-size: 13px; font-weight: 600; color: var(--muted); }
+
+    /* Поиск */
+    .search-box { display: flex; align-items: center; height: 48px; border-radius: 999px; padding: 0 16px; margin-bottom: 12px; }
+    .search-input { flex: 1; background: transparent; border: none; outline: none; color: #fff; font-size: 16px; }
+    .list { display: flex; flex-direction: column; gap: 10px; padding-bottom: 20px; }
+    .item { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 18px; }
+    .item img { width: 50px; height: 50px; border-radius: 12px; object-fit: cover; background: #222; }
+    .item-info { flex: 1; min-width: 0; }
+    .item-t { display: block; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-s { display: block; font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Текст песни */
+    .lyrics-box { flex: 1; display: flex; flex-direction: column; gap: 16px; padding: 20px 0 40px; overflow-y: auto; }
+    .l-line { font-size: 22px; font-weight: 700; color: rgba(255,255,255,0.3); transition: 0.3s; cursor: pointer; }
+    .l-line.active { color: #fff; transform: scale(1.03); transform-origin: left; }
+
+    /* Шторка DSP */
+    .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 20; display: none; }
+    .backdrop.open { display: block; }
+    .sheet {
+      position: fixed; left: 20px; right: 20px; bottom: 16px; max-width: 600px; margin-inline: auto;
+      border-radius: 26px; padding: 20px; z-index: 21;
+      transform: translateY(120%); transition: transform 0.35s var(--spring);
+    }
+    .sheet.open { transform: translateY(0); }
+    .queue-sheet { color: var(--text); margin: auto auto 0; max-height: min(65dvh, 620px); width: calc(100% - 40px); padding: 16px; inset: auto 0 calc(16px + var(--safe-bottom)); }
+    .queue-sheet::backdrop { background: rgba(0,0,0,.6); }
+    .queue-sheet header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .queue-sheet h2 { font-size: 17px; }
+    .queue-sheet .list { padding-bottom: 0; }
+    .queue-sheet .item[aria-current="true"] { border-top-color: currentColor; }
+    .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 16px; }
+    .chip { padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; background: rgba(255,255,255,0.1); }
+    .chip.active { background: #fff; color: #0b0b10; }
+
+    /* Нижняя капсула навигации */
+    .nav-wrap { position: fixed; left: 20px; right: 20px; bottom: 14px; z-index: 10; display: flex; justify-content: center; }
+    .nav-pill { display: flex; width: 100%; max-width: 420px; height: 58px; border-radius: 9999px; padding: 5px; }
+    .nav-btn { flex: 1; height: 48px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--muted); }
+    .nav-btn.active { background: var(--glass-active); color: #fff; }
+
+    [hidden] { display: none !important; }
+    :root {
+      --safe-top: max(env(safe-area-inset-top, 0px), var(--tg-safe-area-inset-top, 0px), var(--tg-content-safe-area-inset-top, 0px));
+      --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px), var(--tg-content-safe-area-inset-bottom, 0px));
+    }
+    .shell { padding-top: calc(14px + var(--safe-top)); padding-bottom: calc(84px + var(--safe-bottom)); }
+    .nav-wrap { bottom: calc(14px + var(--safe-bottom)); }
+    .sheet { bottom: calc(16px + var(--safe-bottom)); }
+    .screen { min-height: 0; scrollbar-width: thin; }
+    .screen h1 { font-size: 24px; margin: 12px 0 18px; line-height: 1.25; }
+    .screen h2 { font-size: 16px; margin: 0 0 10px; }
+    .source-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; margin-bottom: 12px; }
+    select, .room-form input { border: 1px solid rgba(255,255,255,.2); background: #202027; color: #fff; border-radius: 16px; min-height: 48px; padding: 6px 12px; min-width: 0; font: inherit; }
+    .status { color: var(--muted); font-size: 13px; line-height: 1.45; margin-block: 6px; }
+    .status:empty { display: none; }
+    .cover-fallback { display: grid; width: 100%; height: 100%; place-items: center; color: rgba(255,255,255,.6); font-size: 54px; border-radius: inherit; background: radial-gradient(ellipse at 35% 30%, #373740, #202029); }
+    #videoFrame { width: 100%; height: 100%; border: 0; border-radius: 18px; display: block; }
+    .art-box.video { width: min(100%, 640px); height: auto; aspect-ratio: 16/9; border-radius: 18px; animation: none; }
+    .video .cover-fallback, .video .art-img, .video::after { display: none; }
+    .btn, .item, .chip { min-height: 48px; min-width: 48px; }
+    .btn:disabled, .bar:disabled { opacity: .36; cursor: default; }
+    .btn:focus-visible, .item:focus-visible, .search-input:focus-visible, .bar:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+    .item { width: 100%; text-align: left; color: var(--text); cursor: pointer; border-inline: 0; }
+    .item-art { width: 50px; height: 50px; flex: 0 0 50px; border-radius: 12px; display: grid; place-items: center; background: var(--glass); color: var(--muted); }
+    #list .item img { display: block; }
+    .panel { padding: 16px; border-radius: 22px; margin-bottom: 12px; }
+    .room-form { display: flex; justify-content: space-between; gap: 8px; margin-top: 10px; }
+    .room-form input { flex: 1; user-select: text; }
+    .room-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    #statsTime { font-size: 22px; }
+    .rank-list { padding-left: 20px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .rank-list li { margin: 4px 0; overflow-wrap: anywhere; }
+    .l-line { font: inherit; font-size: 20px; font-weight: 700; text-align: left; border: 0; background: transparent; min-height: 48px; }
+    .l-line:disabled { cursor: default; }
+    .plain-lyrics { white-space: pre-wrap; line-height: 1.55; color: var(--muted); }
+    .attribution { color: var(--muted); font-size: 11px; margin-top: 7px; text-align: center; text-decoration: underline; }
+    @media (max-width: 372px) {
+      .nav-wrap { left: 10px; right: 10px; }
+      .nav-btn { font-size: 11px; min-width: 49px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+    }
+  </style>
+</head>
+<body>
+  <div id="bg" class="ambient"></div>
+
+  <div class="shell">
+    <!-- ЭКРАН 1: ПЛЕЕР -->
+    <section id="scrPlayer" class="screen active">
+      <div class="top-bar">
+        <span id="badge" class="pill-badge glass">PUMP</span>
+        <button class="btn pill-badge glass" data-action="style">Вид обложки ✦</button>
+      </div>
+
+      <div class="art-stage">
+        <div id="artBox" class="art-box card">
+          <img id="cover" class="art-img" alt="Обложка трека" hidden />
+          <span id="coverFallback" class="cover-fallback" aria-hidden="true">♫</span>
+          <iframe id="videoFrame" title="Видео YouTube" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen hidden></iframe>
+        </div>
+      </div>
+
+      <div class="meta">
+        <div class="titles">
+          <div id="tTitle" class="title">Выбери трек</div>
+          <div id="tArtist" class="artist">Нажми Play или открой Поиск</div>
+        </div>
+        <button id="likeBtn" class="btn like-btn glass" aria-label="В избранное" aria-pressed="false" data-action="like">♥</button>
+      </div>
+
+      <div class="scrubber-wrap">
+        <input id="seekBar" class="bar" type="range" min="0" max="100" value="0" step="0.1" aria-label="Позиция воспроизведения" disabled />
+        <div id="playerStatus" class="status" role="status"></div>
+        <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>
+      </div>
+
+      <div class="controls">
+        <button id="shufBtn" class="btn c-sec" aria-label="Случайный порядок" aria-pressed="false" data-action="shuffle">⇄</button>
+        <button class="btn c-skip" data-action="previous" aria-label="Предыдущий трек"><span class="media-icon" aria-hidden="true"></span></button>
+        <button id="playBtn" class="btn c-play" aria-label="Играть" data-action="play"><span class="media-icon" aria-hidden="true"></span></button>
+        <button class="btn c-skip" data-action="next" aria-label="Следующий трек"><span class="media-icon" aria-hidden="true"></span></button>
+        <button id="repBtn" class="btn c-sec" aria-label="Повтор трека" aria-pressed="false" data-action="repeat">↻</button>
+      </div>
+
+      <div class="dock glass">
+        <button class="btn dock-btn" data-action="tab" data-value="lyrics">Текст песни</button>
+        <button id="queueButton" class="btn dock-btn" data-action="queue-open">Очередь</button>
+        <button class="btn dock-btn" data-action="settings-open">Настройки</button>
+      </div>
+      <a id="attribution" class="attribution" href="https://www.soundhelix.com" target="_blank" rel="noopener" hidden>Music by SoundHelix</a>
+    </section>
+
+    <!-- ЭКРАН 2: ПОИСК -->
+    <section id="scrSearch" class="screen">
+      <div class="search-box glass">
+        <input id="qInput" class="search-input" type="search" maxlength="140" placeholder="Трек, артист или ссылка YouTube" aria-label="Поиск музыки" />
+      </div>
+      <div class="source-row">
+        <label for="source">Источник</label>
+        <select id="source" class="glass">
+          <option value="all">Все</option>
+          <option value="full">Полные записи</option>
+          <option value="preview">Превью iTunes</option>
+          <option value="youtube">YouTube</option>
+          <option value="favorites">Избранное</option>
+        </select>
+      </div>
+      <div id="sStatus" role="status" style="font-size:13px; color:var(--muted); margin-bottom:10px;">Подборка треков:</div>
+      <div id="list" class="list"></div>
+    </section>
+
+    <!-- ЭКРАН 3: ТЕКСТ -->
+    <section id="scrLyrics" class="screen">
+      <div class="top-bar"><span class="pill-badge glass">Синхронный текст</span></div>
+      <div id="lyricsBox" class="lyrics-box">
+        <div class="l-line active">Включи трек, чтобы увидеть текст песни...</div>
+      </div>
+    </section>
+
+    <section id="scrRooms" class="screen">
+      <h1>Слушаем вместе</h1>
+      <div class="panel glass">
+        <button id="createRoom" class="btn chip active" data-action="create-room">Создать комнату</button>
+        <form id="joinRoom" class="room-form">
+          <input id="roomCode" aria-label="Код комнаты" placeholder="Код комнаты" maxlength="12" autocomplete="off" />
+          <button class="btn chip" type="submit">Войти</button>
+        </form>
+        <p id="roomStatus" class="status" role="status"></p>
+        <div id="roomConnected" class="room-actions" hidden>
+          <button class="btn chip" data-action="copy-room">Скопировать код</button>
+          <button id="enableRoomSound" class="btn chip active" data-action="enable-room-sound" hidden>Включить звук</button>
+          <button class="btn chip" data-action="leave-room">Выйти</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="scrStats" class="screen">
+      <h1>Итоги прослушиваний</h1>
+      <div class="source-row">
+        <label for="statsPeriod">Период</label>
+        <select id="statsPeriod" class="glass"><option value="week">7 дней</option><option value="month">30 дней</option></select>
+      </div>
+      <p id="statsStatus" class="status" role="status"></p>
+      <div id="statsContent" hidden>
+        <div class="panel glass"><strong id="statsTime"></strong><p id="statsCount" class="status"></p></div>
+        <div class="panel glass"><h2>Топ треков</h2><ol id="statsTracks" class="rank-list"></ol></div>
+        <div class="panel glass"><h2>Топ артистов</h2><ol id="statsArtists" class="rank-list"></ol></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ШТОРКА НАСТРОЕК -->
+  <div id="backdrop" class="backdrop" data-action="settings-close"></div>
+  <div id="sheet" class="sheet glass" aria-label="Скорость и таймер" hidden>
+    <div style="font-size:17px; font-weight:700; margin-bottom:10px;">Скорость воспроизведения</div>
+    <div class="chips">
+      <button class="btn chip" data-action="rate" data-value="0.85">0.85x Slowed</button>
+      <button class="btn chip active" data-action="rate" data-value="1.0">1.0x Норма</button>
+      <button class="btn chip" data-action="rate" data-value="1.15">1.15x Speed</button>
+    </div>
+    <div style="font-size:17px; font-weight:700; margin-bottom:10px;">Таймер сна</div>
+    <div class="chips">
+      <button id="sleepBtn" class="btn chip" data-action="sleep">Таймер: Выкл</button>
+    </div>
+  </div>
+
+  <dialog id="queueSheet" class="sheet queue-sheet open glass" aria-labelledby="queueTitle">
+    <header>
+      <h2 id="queueTitle">Очередь</h2>
+      <button type="button" class="btn chip" data-action="queue-close" aria-label="Закрыть очередь">×</button>
+    </header>
+    <div id="queueList" class="list"></div>
+  </dialog>
+
+  <!-- НАВИГАЦИЯ -->
+  <nav class="nav-wrap">
+    <div class="nav-pill glass">
+      <button id="tabPlayer" class="btn nav-btn active" data-action="tab" data-value="player">Плеер</button>
+      <button id="tabSearch" class="btn nav-btn" data-action="tab" data-value="search">Поиск</button>
+      <button id="tabLyrics" class="btn nav-btn" data-action="tab" data-value="lyrics">Текст</button>
+      <button id="tabRooms" class="btn nav-btn" data-action="tab" data-value="rooms">Комната</button>
+      <button id="tabStats" class="btn nav-btn" data-action="tab" data-value="stats">Итоги</button>
+    </div>
+  </nav>
+
+  <audio id="audio" preload="metadata"></audio>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
