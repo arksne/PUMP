@@ -64,7 +64,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 -m venv .venv
-.venv/bin/pip install playwright==1.58.2
+.venv/bin/pip install playwright==1.62.0
 .venv/bin/python -m playwright install chromium
 .venv/bin/python tests/browser.py
 ```

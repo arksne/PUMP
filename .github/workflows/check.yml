@@ -20,7 +20,7 @@ jobs:
       - run: cargo build --locked
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: python3 -m venv /tmp/pump-tests
-      - run: /tmp/pump-tests/bin/pip install playwright==1.58.2
+      - run: /tmp/pump-tests/bin/pip install playwright==1.62.0
       - run: /tmp/pump-tests/bin/python -m playwright install --with-deps chromium
       - run: /tmp/pump-tests/bin/python tests/browser.py
 
