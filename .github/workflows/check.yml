@@ -32,4 +32,7 @@ jobs:
       - name: Проверка контейнера
         run: |
           docker run -d --name pump -p 127.0.0.1:8080:8080 pump:ci
-          curl --fail --silent --show-error --retry 10 --retry-connrefused http://127.0.0.1:8080/healthz
+          curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 1 --max-time 3 http://127.0.0.1:8080/healthz
+      - name: Лог контейнера при ошибке
+        if: failure()
+        run: docker logs pump
