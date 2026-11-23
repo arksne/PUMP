@@ -76,7 +76,12 @@ async fn downloads_audio_and_writes_metadata_atomically() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut input = [0; 4096];
-        socket.read(&mut input).await.unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let count = socket.read(&mut input).await.unwrap();
+            assert!(count > 0 && header.len() + count <= 8192);
+            header.extend_from_slice(&input[..count]);
+        }
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             wav.len()
