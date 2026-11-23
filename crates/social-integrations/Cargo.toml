@@ -1,0 +1,30 @@
+[package]
+name = "social-integrations"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone music service clients, durable scrobbling and local audio matching"
+
+# Изолированный workspace: подключение к родительскому выполняется отдельно.
+
+[features]
+default = []
+discord = []
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+fs2 = "0.4"
+md-5 = "0.10"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "net", "time", "sync"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,18 @@
+[package]
+name = "plugin-spine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "Изолированные музыкальные провайдеры WebAssembly для PUMP"
+
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = { version = "2", features = ["serde"] }
+wasmtime = { version = "36.0.23", default-features = false, features = ["std", "runtime", "cranelift"] }
+
+[dev-dependencies]
+wat = "1"

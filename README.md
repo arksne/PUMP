@@ -2,6 +2,50 @@
 
 Музыкальный плеер на основе Liquid Glass для браузера и Telegram Mini App. Сервер на Rust обслуживает интерфейс, каталог, WebSocket-комнаты и статистику SQLite. Бот работает через Teloxide.
 
+## Cargo Workspace
+
+Сервер запускается прежним бинарным файлом `pump`. В workspace находятся восемь крейтов.
+
+| Крейт | Назначение |
+| --- | --- |
+| `core-streaming` | Каталог, InnerTube, сессионная подпись, выбор потоков и HTTP Range proxy |
+| `audio-dsp-engine` | PCM, Symphonia, Rubato/WSOLA, EQ, реверберация, анализ громкости, сведение и очередь |
+| `lyrics-engine` | Параллельный запрос текстов, Enhanced LRC/TTML, временные границы слов и голосов |
+| `library-storage` | SQLite сессий и статистики, загрузки, аудиотеги, обложки, WebDAV и SMB |
+| `social-integrations` | Spotify PKCE, Apple metadata, Last.fm, Discord IPC и локальные FFT-отпечатки |
+| `plugin-spine` | WASM ABI, лимиты памяти/топлива/времени, поиск и резервные качества |
+| `telegram-bridge` | Сервер Axum, бот, webhook, пульт Mini App, импорты и распознавание |
+| `ui-liquid-glass` | Ресурсы приложения и Rust/WASM-утилиты интерфейса |
+
+Браузер воспроизводит аудио и управляет WebAudio через JavaScript. Нативный DSP предоставляет Rust API. Дополнительные возможности включаются Cargo features `audio-dsp-engine/native-output`, `audio-dsp-engine/dlna`, `library-storage/smb`, `social-integrations/discord`. Для ALSA на Linux нужен пакет `libasound2-dev`.
+
+## Дополнительные интеграции
+
+`PUMP_YOUTUBE_COOKIES` включает сессионную подпись запросов InnerTube. Сервер перебирает клиентские профили и возвращает доступные прямые форматы через `/api/streams/{id}`. Форматы с шифрованной подписью, ограничения аккаунта и блокировки со стороны YouTube могут потребовать встроенный видеоплеер. Cookies хранятся в секретах окружения.
+
+`SPOTIFY_CLIENT_ID` включает OAuth через POST `/api/spotify/authorize`. В Spotify Developer Dashboard нужно зарегистрировать публичный callback `/api/spotify/callback` на адресе PUMP. POST `/api/import` принимает `source` (`spotify` или `apple`) и `link`. Ответ сохраняет позиции исходных треков и явно показывает неоднозначные совпадения. Подключение Spotify пока хранится в памяти процесса. Публичные ссылки Apple обрабатываются в пределах доступных метаданных iTunes Lookup, для полноценного каталога плейлистов требуется MusicKit.
+
+`LASTFM_API_KEY` и `LASTFM_SHARED_SECRET` задают приложение Last.fm. Пользователь подключает свой session key в настройках библиотеки. Ключ сессии хранится в памяти, а события на повторную отправку — в локальном файле пользователя.
+
+`AUDD_TOKEN` включает распознавание голосовых сообщений и кружочков, пересланных в бот, и POST `/api/recognize` с бинарным аудио. Самостоятельная библиотека отпечатков ищет по записям, которые приложение заранее проиндексировало. Глобальную базу распознавания предоставляет AudD.
+
+Команды `/play название`, `/queue название`, `/pause`, `/next`, `/previous`, `/seek секунды`, `/eq десять_значений` управляют открытой Mini App той же Telegram-сессии. `/stats` и `/stats month` отправляют PNG-карточку с итогами. Проверка этих команд требует подключения Telegram и действий пользователя в Mini App.
+
+Загрузки сервера доступны через `/api/downloads`, POST `/api/downloads/{id}` и авторизованный GET `/api/downloads/{id}/file`. Клиентская кнопка скачивания сохраняет аудио на устройстве в IndexedDB. Настройка «Только офлайн» отключает запросы к API и оставляет локальные записи. Постоянное облачное хранилище подключается на заключительном этапе проекта.
+
+WASM-провайдеры описаны в [ABI](crates/plugin-spine/ABI.md). Файлы провайдеров загружаются из `PUMP_PLUGIN_DIR` при запуске. Пример WAT в тестах — проверочный модуль.
+
+## Пересборка браузерного WASM
+
+Готовые файлы `web/pkg` входят в исходники и используются сервером. После изменения Rust-функций интерфейса их можно обновить.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+cargo build -p ui-liquid-glass --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir web/pkg --out-name ui_liquid_glass target/wasm32-unknown-unknown/release/ui_liquid_glass.wasm
+```
+
 ## Запуск на компьютере
 
 1. Установи стабильный Rust через [rustup](https://rustup.rs/). Для сборки на Linux тоже понадобятся компилятор C и linker (пакет `build-essential` на Debian/Ubuntu).
@@ -60,8 +104,8 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pump-data:/app/data pump
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked
 cargo build --locked
 python3 -m venv .venv
 .venv/bin/pip install playwright==1.62.0
@@ -70,3 +114,11 @@ python3 -m venv .venv
 ```
 
 Браузерным тестам нужен FFmpeg. Они поднимают сервер с отдельной SQLite, проверяют HTTP Range и воспроизведение в двух мобильных сессиях Chromium без токена Telegram. `GET /healthz` возвращает состояние процесса для хостинга.
+
+## Границы текущей реализации
+
+Реализованы серверные и нативные API перечисленных модулей. Плеер Telegram использует WebAudio, а его Rust/WASM-модуль выполняет поиск настроек и обработку палитры. Для полноценного Rust/WASM-клиента и использования нативного DSP в браузерном аудиотракте потребуется дальнейшая интеграция.
+
+Для живых проверок внешних аккаунтов нужны Spotify Client ID, данные приложения и сессии Last.fm, токен AudD. Проверка SMB/DLNA/Discord и аудиоустройств требует доступных устройств или локальных сервисов. Сборка соответствующих Cargo features проверяется отдельно от подключения к ним.
+
+В YouTube ещё требуется поддержка зашифрованных signatureCipher/n-signature и связанных ограничений источника. Комнаты совместного прослушивания сейчас синхронизируют аудиопотоки каталога, а точность 200 мс требует измерений на пользовательской сети. Встраивание полного нативного Automix/DJ/Concert Mode в Mini App, интерфейсы NAS и менеджера плагинов, полноценный импорт плейлистов Apple через MusicKit и системные виджеты остаются следующими задачами. Постоянная облачная БД и файловое хранилище подключаются на заключительном этапе.

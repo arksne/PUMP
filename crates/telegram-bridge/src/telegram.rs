@@ -165,6 +165,43 @@ async fn message(
     app: App,
     settings: Arc<Settings>,
 ) -> Result<(), HandlerError> {
+    if message.chat.is_private() {
+        let media = message
+            .voice()
+            .map(|voice| &voice.file)
+            .or_else(|| message.video_note().map(|note| &note.file));
+        if let Some(media) = media {
+            if media.size > 20 * 1024 * 1024 {
+                bot.send_message(message.chat.id, "Запись должна быть меньше 20 МБ.")
+                    .await?;
+                return Ok(());
+            }
+            if crate::setting("AUDD_TOKEN").is_none() {
+                bot.send_message(
+                    message.chat.id,
+                    "Для распознавания нужно настроить AUDD_TOKEN на сервере PUMP.",
+                )
+                .await?;
+                return Ok(());
+            }
+            use teloxide::net::Download;
+            let file = bot.get_file(media.id.clone()).await?;
+            let mut bytes = Vec::new();
+            bot.download_file(&file.path, &mut bytes).await?;
+            let answer = match crate::recognition::identify(bytes).await {
+                Ok(result) if !result.is_null() => format!(
+                    "{} — {}\n{}",
+                    result["artist"].as_str().unwrap_or(""),
+                    result["title"].as_str().unwrap_or(""),
+                    result["song_link"].as_str().unwrap_or("")
+                ),
+                Ok(_) => "Совпадение не найдено.".into(),
+                Err(_) => "Распознавание сейчас недоступно.".into(),
+            };
+            bot.send_message(message.chat.id, answer).await?;
+            return Ok(());
+        }
+    }
     let command = message
         .text()
         .unwrap_or("")
@@ -188,13 +225,18 @@ async fn message(
         && message.chat.is_private()
         && let Some(user) = &message.from
     {
+        let period = if message.text().unwrap_or("").split_whitespace().nth(1) == Some("month") {
+            Period::Month
+        } else {
+            Period::Week
+        };
         let stats = app
             .stats
-            .read(&format!("telegram:{}", user.id.0), Period::Week)
+            .read(&format!("telegram:{}", user.id.0), period)
             .await?;
         let seconds = stats.milliseconds.max(0) / 1000;
         let mut report = format!(
-            "Итоги за 7 дней\n{} мин {} сек · треков: {}",
+            "Итоги прослушиваний\n{} мин {} сек · треков: {}",
             seconds / 60,
             seconds % 60,
             stats.tracks
@@ -207,11 +249,105 @@ async fn message(
                 rank.title
             ));
         }
-        bot.send_message(
+        let png = crate::cards::render(&stats)?;
+        bot.send_photo(
             message.chat.id,
-            report.chars().take(4090).collect::<String>(),
+            teloxide::types::InputFile::memory(png).file_name("pump-stats.png"),
         )
+        .caption(report.chars().take(1000).collect::<String>())
         .await?;
+    }
+    if message.chat.is_private()
+        && let Some(user) = &message.from
+    {
+        let argument = message
+            .text()
+            .unwrap_or("")
+            .split_once(char::is_whitespace)
+            .map(|(_, value)| value.trim())
+            .unwrap_or("");
+        if let Some(action) = match command {
+            "/play" => Some("play"),
+            "/pause" => Some("pause"),
+            "/next" => Some("next"),
+            "/previous" => Some("previous"),
+            "/seek" => Some("seek"),
+            "/queue" => Some("queue"),
+            "/eq" => Some("eq"),
+            _ => None,
+        } {
+            let mut control = crate::controls::Command::new(action);
+            if matches!(action, "play" | "queue") && !argument.is_empty() {
+                let found = app
+                    .catalog
+                    .search(SearchQuery {
+                        q: argument.chars().take(140).collect(),
+                        source: Source::Full,
+                    })
+                    .await?;
+                let Some(track) = found.tracks.first() else {
+                    bot.send_message(message.chat.id, "Трек не найден в медиатеке.")
+                        .await?;
+                    return Ok(());
+                };
+                control.track_id = Some(track.id.clone());
+            }
+            if action == "seek" {
+                let seconds = argument
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.0..=86400.0).contains(value));
+                let Some(seconds) = seconds else {
+                    bot.send_message(
+                        message.chat.id,
+                        "Укажи позицию в секундах, например /seek 90",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                control.position_ms = Some((seconds * 1000.0) as u64);
+            }
+            if action == "eq" {
+                let gains = argument
+                    .split_whitespace()
+                    .map(str::parse::<f32>)
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(gains) = gains else {
+                    bot.send_message(
+                        message.chat.id,
+                        "Для /eq нужны 10 значений усиления от −12 до 12 дБ.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                if gains.len() != 10
+                    || gains
+                        .iter()
+                        .any(|gain| !gain.is_finite() || !(-12.0..=12.0).contains(gain))
+                {
+                    bot.send_message(
+                        message.chat.id,
+                        "Для /eq нужны 10 значений усиления от −12 до 12 дБ.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                control.bands = Some(gains);
+            }
+            let delivered = app
+                .controls
+                .send(&format!("telegram:{}", user.id.0), control)
+                .await;
+            bot.send_message(
+                message.chat.id,
+                if delivered {
+                    "Команда отправлена в плеер."
+                } else {
+                    "Открой PUMP через кнопку бота, чтобы подключить плеер."
+                },
+            )
+            .await?;
+        }
     }
     Ok(())
 }

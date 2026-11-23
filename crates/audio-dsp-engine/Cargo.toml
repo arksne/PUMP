@@ -1,0 +1,25 @@
+[package]
+name = "audio-dsp-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Headless stereo DSP, analysis and playback primitives for PUMP"
+
+[features]
+default = ["decode", "time-stretch"]
+decode = ["dep:symphonia"]
+time-stretch = ["dep:rubato"]
+native-output = ["dep:rodio", "decode"]
+dlna = ["dep:tokio", "dep:reqwest", "dep:roxmltree", "dep:url"]
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["net", "time"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+roxmltree = { version = "0.20", optional = true }
+url = { version = "2", optional = true }
+rubato = { version = "0.16", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rodio = { version = "0.20", optional = true, default-features = false }

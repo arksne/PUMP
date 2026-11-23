@@ -6,3 +6,5 @@
 !src/**
 !web/
 !web/**
+!crates/
+!crates/**

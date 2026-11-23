@@ -2,6 +2,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock index.html ./
 COPY src ./src
+COPY crates ./crates
 COPY web ./web
 RUN --mount=type=secret,id=cargo_ca \
     --mount=type=cache,target=/usr/local/cargo/registry \

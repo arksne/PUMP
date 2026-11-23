@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -128,6 +129,34 @@ class PlayerTest(unittest.TestCase):
         stats = json.loads(data)
         self.assertEqual((stats["tracks"], stats["milliseconds"]), (1, 1200))
         self.assertEqual(stats["top_artists"][0]["title"], track["artist"])
+
+    def test_settings_profile_and_offline_audio(self):
+        with sync_playwright() as driver:
+            browser=driver.chromium.launch(executable_path=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium"))
+            page=browser.new_page(**driver.devices["Pixel 7"])
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+            page.goto(self.origin)
+            self.assertTrue(page.evaluate("() => PumpUX.wasmReady"))
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("full")
+            page.locator("#qInput").fill("North")
+            page.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(page,"audio => audio.currentTime > 0.4")
+            page.locator('[data-action="settings-open"]').click()
+            page.locator("#eqEnabled").check()
+            page.locator("#autoEqFile").set_input_files({"name":"headphones.txt","mimeType":"text/plain","buffer":b"Preamp: -4 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1.4"})
+            expect(page.locator("#settingsStatus")).to_have_text("Параметрический профиль применён.")
+            page.get_by_text("Оформление",exact=True).click()
+            page.locator("#designSelect").select_option("classic-glass")
+            expect(page.locator("#artBox")).to_have_class(re.compile(r".*\bclassic-glass\b.*"))
+            page.get_by_text("Хранилище",exact=True).click()
+            page.locator("#downloadButton").click()
+            expect(page.locator("#offlineStatus")).to_have_text("Запись доступна на этом устройстве.",timeout=15000)
+            expect(page.locator("#downloadsList")).to_contain_text("North Loop")
+            self.assertEqual(errors,[])
+            browser.close()
 
     def test_two_people_listen_together(self):
         with sync_playwright() as driver:

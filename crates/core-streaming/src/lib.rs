@@ -1,7 +1,10 @@
 //! Поиск по файлам, полным демотрекам, превью iTunes и каталогу YouTube.
 //! Тип источника хранится отдельно. Клиент не принимает превью за полную запись.
 
-use crate::{ApiError, MAX_TRACK_MS};
+mod error;
+pub mod innertube;
+pub use error::ApiError;
+pub const MAX_TRACK_MS: u64 = 24 * 60 * 60 * 1000;
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
@@ -26,9 +29,9 @@ use url::Url;
 
 // Обложки сохранены из исходного прототипа, чтобы не зависеть от доступа браузера к CDN.
 const DEMO_COVERS: [&[u8]; 3] = [
-    include_bytes!("../web/covers/demo-1.jpg"),
-    include_bytes!("../web/covers/demo-2.jpg"),
-    include_bytes!("../web/covers/demo-3.jpg"),
+    include_bytes!("../../../web/covers/demo-1.jpg"),
+    include_bytes!("../../../web/covers/demo-2.jpg"),
+    include_bytes!("../../../web/covers/demo-3.jpg"),
 ];
 
 fn demo_number(id: &str) -> Option<usize> {
@@ -42,14 +45,14 @@ fn demo_number(id: &str) -> Option<usize> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Kind {
+pub enum Kind {
     Full,
     Preview,
     Youtube,
 }
 
 #[derive(Clone, Serialize)]
-pub(crate) struct Track {
+pub struct Track {
     pub id: String,
     pub title: String,
     pub artist: String,
@@ -70,7 +73,7 @@ struct LocalFile {
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Source {
+pub enum Source {
     #[default]
     All,
     Full,
@@ -79,7 +82,7 @@ pub(crate) enum Source {
 }
 
 #[derive(Default, Deserialize)]
-pub(crate) struct SearchQuery {
+pub struct SearchQuery {
     #[serde(default)]
     pub q: String,
     #[serde(default)]
@@ -87,13 +90,13 @@ pub(crate) struct SearchQuery {
 }
 
 #[derive(Clone, Serialize)]
-pub(crate) struct Search {
+pub struct Search {
     pub tracks: Vec<Track>,
     pub notice: Option<&'static str>,
 }
 
 #[derive(Default, Serialize)]
-pub(crate) struct Lyrics {
+pub struct Lyrics {
     synced: Option<String>,
     plain: Option<String>,
 }
@@ -101,18 +104,20 @@ pub(crate) struct Lyrics {
 type SearchCache = HashMap<(u8, String), (Instant, Vec<Track>)>;
 type LookupCache = HashMap<String, (Instant, Track)>;
 
-pub(crate) struct Catalog {
+pub struct Catalog {
     full: Vec<Track>,
     local: HashMap<String, LocalFile>,
     fixed: HashMap<String, Track>,
     http: reqwest::Client,
     youtube_key: Option<String>,
+    auth: Option<innertube::SessionAuth>,
+    streams: RwLock<HashMap<String, innertube::Streams>>,
     queries: RwLock<SearchCache>,
     lookup: RwLock<LookupCache>,
 }
 
 impl Catalog {
-    pub(crate) async fn load(
+    pub async fn load(
         dir: Option<PathBuf>,
         http: reqwest::Client,
         youtube_key: Option<String>,
@@ -143,25 +148,131 @@ impl Catalog {
             fixed,
             http,
             youtube_key,
+            auth: None,
+            streams: RwLock::default(),
             queries: RwLock::default(),
             lookup: RwLock::default(),
         })
     }
 
-    pub(crate) fn local_count(&self) -> usize {
+    pub fn with_session(mut self, cookies: Option<String>) -> anyhow::Result<Self> {
+        self.auth = cookies
+            .map(innertube::SessionAuth::from_cookies)
+            .transpose()?;
+        Ok(self)
+    }
+
+    pub async fn streams(
+        &self,
+        id: &str,
+        options: &innertube::StreamOptions,
+    ) -> Result<innertube::Streams, ApiError> {
+        let video = id
+            .strip_prefix("yt-")
+            .filter(|id| valid_video(id))
+            .ok_or_else(|| ApiError::invalid("Для потоков требуется видео YouTube."))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cached = self
+            .streams
+            .read()
+            .await
+            .get(id)
+            .filter(|streams| streams.expires_at > now)
+            .cloned();
+        let all = match cached {
+            Some(streams) => streams,
+            None => {
+                let streams = innertube::player(&self.http, video, self.auth.as_ref()).await?;
+                let mut cache = self.streams.write().await;
+                cache.retain(|_, value| value.expires_at > now);
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache.insert(id.to_owned(), streams.clone());
+                streams
+            }
+        };
+        let streams = all.select(options);
+        if streams.is_empty() {
+            return Err(ApiError::unavailable(
+                "Источник не вернул формат для выбранного режима.",
+            ));
+        }
+        Ok(innertube::Streams {
+            streams,
+            expires_at: all.expires_at,
+        })
+    }
+
+    pub async fn stream(
+        &self,
+        id: &str,
+        format_id: u64,
+        method: Method,
+        headers: &HeaderMap,
+    ) -> Result<Response, ApiError> {
+        let _ = self.streams(id, &innertube::StreamOptions::default()).await;
+        let stream = self
+            .streams
+            .read()
+            .await
+            .get(id)
+            .and_then(|all| all.streams.iter().find(|item| item.format_id == format_id))
+            .cloned()
+            .ok_or_else(|| ApiError::missing("Поток не найден. Повтори получение форматов."))?;
+        let mut request = self
+            .http
+            .request(method, &stream.upstream)
+            .timeout(Duration::from_secs(120));
+        if let Some(range) = headers.get(header::RANGE) {
+            request = request.header(header::RANGE, range);
+        }
+        let upstream = request
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable("Не удалось открыть поток."))?;
+        let status = upstream.status();
+        if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
+            self.streams.write().await.remove(id);
+            return Err(ApiError::unavailable(
+                "Формат недоступен. Выбери резервный поток.",
+            ));
+        }
+        let mut response = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, &stream.mime_type)
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        for name in [
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ] {
+            if let Some(value) = upstream.headers().get(&name) {
+                response = response.header(name, value);
+            }
+        }
+        response
+            .body(Body::from_stream(upstream.bytes_stream()))
+            .map_err(|_| ApiError::unavailable("Некорректный ответ источника."))
+    }
+
+    pub fn local_count(&self) -> usize {
         self.local.len()
     }
-    pub(crate) fn media(&self, id: &str) -> Option<PathBuf> {
+    pub fn media(&self, id: &str) -> Option<PathBuf> {
         self.local.get(id).map(|item| item.path.clone())
     }
-    pub(crate) fn cover(&self, id: &str) -> Option<(&'static str, Bytes)> {
+    pub fn cover(&self, id: &str) -> Option<(&'static str, Bytes)> {
         if let Some(n) = demo_number(id) {
             return Some(("image/jpeg", Bytes::from_static(DEMO_COVERS[n - 1])));
         }
         self.local.get(id)?.cover.clone()
     }
 
-    pub(crate) async fn demo_audio(
+    pub async fn demo_audio(
         &self,
         id: &str,
         method: Method,
@@ -203,7 +314,56 @@ impl Catalog {
             .body(Body::from_stream(upstream.bytes_stream()))
             .map_err(|_| ApiError::unavailable("Некорректный ответ SoundHelix."))
     }
-    pub(crate) async fn track(&self, id: &str) -> Option<Track> {
+    pub async fn preview_audio(
+        &self,
+        id: &str,
+        method: Method,
+        headers: &HeaderMap,
+    ) -> Result<Response, ApiError> {
+        let track = self
+            .track(id)
+            .await
+            .filter(|track| track.kind == Kind::Preview)
+            .ok_or_else(|| ApiError::missing("Превью не найдено."))?;
+        let url = track
+            .audio_url
+            .as_deref()
+            .and_then(apple_asset)
+            .ok_or_else(|| ApiError::invalid("Некорректный адрес превью."))?;
+        let mut request = self
+            .http
+            .request(method, url)
+            .timeout(Duration::from_secs(120));
+        if let Some(range) = headers.get(header::RANGE) {
+            request = request.header(header::RANGE, range);
+        }
+        let upstream = request
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable("Превью недоступно."))?;
+        if !upstream.status().is_success() && upstream.status() != StatusCode::RANGE_NOT_SATISFIABLE
+        {
+            return Err(ApiError::unavailable("Превью недоступно."));
+        }
+        let mut response = Response::builder()
+            .status(upstream.status())
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ] {
+            if let Some(value) = upstream.headers().get(&name) {
+                response = response.header(name, value);
+            }
+        }
+        response
+            .body(Body::from_stream(upstream.bytes_stream()))
+            .map_err(|_| ApiError::unavailable("Некорректный ответ превью."))
+    }
+
+    pub async fn track(&self, id: &str) -> Option<Track> {
         if let Some(item) = self.fixed.get(id) {
             return Some(item.clone());
         }
@@ -219,7 +379,7 @@ impl Catalog {
         None
     }
 
-    pub(crate) async fn search(&self, query: SearchQuery) -> Result<Search, ApiError> {
+    pub async fn search(&self, query: SearchQuery) -> Result<Search, ApiError> {
         let term = query.q.trim();
         if term.chars().count() > 140 {
             return Err(ApiError::invalid("Поисковый запрос слишком длинный."));
@@ -385,19 +545,30 @@ impl Catalog {
                 })
                 .collect());
         }
-        let data: Value = self.http.post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
+        let mut request = self.http.post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
             .header("Origin", "https://music.youtube.com")
             .json(&json!({
                 "query": term,
                 "context": {"client": {"clientName":"WEB_REMIX","clientVersion":"1.20260608.01.00","hl":"ru"}}
-            }))
-            .send().await.map_err(|_| ())?.error_for_status().map_err(|_| ())?.json().await.map_err(|_| ())?;
+            }));
+        if let Some(auth) = &self.auth {
+            request = request.headers(auth.headers().map_err(|_| ())?);
+        }
+        let data: Value = request
+            .send()
+            .await
+            .map_err(|_| ())?
+            .error_for_status()
+            .map_err(|_| ())?
+            .json()
+            .await
+            .map_err(|_| ())?;
         let mut tracks = Vec::new();
         parse_innertube(&data, &mut tracks);
         Ok(tracks)
     }
 
-    pub(crate) async fn lyrics(&self, track: &Track) -> Result<Lyrics, ApiError> {
+    pub async fn lyrics(&self, track: &Track) -> Result<Lyrics, ApiError> {
         if track.artist.is_empty() {
             return Ok(Lyrics::default());
         }

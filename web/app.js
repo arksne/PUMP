@@ -3,7 +3,7 @@
 const node = id => document.getElementById(id);
 const audio = node("audio"), seek = node("seekBar"), cover = node("cover"), frame = node("videoFrame");
 const tabs = {player:["scrPlayer","tabPlayer"], search:["scrSearch","tabSearch"], lyrics:["scrLyrics","tabLyrics"], rooms:["scrRooms","tabRooms"], stats:["scrStats","tabStats"]};
-const styles = ["card", "vinyl", "clover"];
+const styles = ["card", "vinyl", "clover", "classic-glass", "full-bleed"];
 const labels = {full:"Полная запись", preview:"Превью", youtube:"Видео"};
 const known = new Map();
 let results = [], queue = [], selected = null, index = -1, currentTab = "player";
@@ -12,7 +12,11 @@ let mountedVideo = null, lyricLines = [], lyricIndex = -1, lyricRequest = null;
 let searchRequest = null, searchTimer = null, statsSeq = 0;
 let token = stored("pump.session", ""), pending = stored("pump.listens", []);
 let gettingSession = null, activeSession = null, sending = null, listening = null, meter = null;
+let localOnly=stored("pump.localOnly",false);
 let room = null;
+let scrobbleState=null,lastfmConnected=false;
+let streamCandidates=[], streamIndex=0, streamSelection=0;
+const streamVideo=node("streamVideo");
 
 function stored(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -43,6 +47,7 @@ function asset(value) {
   } catch { return null; }
 }
 async function api(path, {method="GET", body, signal, auth=false, keepalive=false} = {}) {
+  if(localOnly)throw new Error("Включён режим «Только офлайн».");
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (auth && token) headers.Authorization = "Bearer " + token;
@@ -93,6 +98,7 @@ async function session() {
       token = result.token;
       persist("pump.session", token);
       activeSession = result;
+      connectControls();
       return result;
     })().finally(() => { gettingSession = null; });
   }
@@ -100,6 +106,8 @@ async function session() {
 }
 
 async function search() {
+  if(localOnly){const records=await PumpUX.transaction("downloads","getAll");const query=node("qInput").value.toLocaleLowerCase();results=records.filter(record=>(record.track.title+" "+record.track.artist).toLocaleLowerCase().includes(query)).map(record=>({...record.track,offlineBlob:record.blob}));renderResults("Офлайн-медиатека");return;}
+
   const query = node("qInput").value.trim(), source = node("source").value;
   searchRequest?.abort();
   if (source === "favorites") {
@@ -160,6 +168,7 @@ function renderQueue() {
 }
 
 function clearVideo() {
+  streamVideo.pause();streamVideo.removeAttribute("src");streamVideo.hidden=true;
   frame.hidden = true;
   frame.removeAttribute("src");
   mountedVideo = null;
@@ -171,7 +180,11 @@ function selectTrack(track, remote=false) {
   audio.pause();
   audio.removeAttribute("src");
   clearVideo();
+  streamSelection++;streamCandidates=[];
+  if(canvasUrl){node("canvasVideo").pause();node("canvasVideo").removeAttribute("src");node("canvasVideo").hidden=true;URL.revokeObjectURL(canvasUrl);canvasUrl=null;}
   selected = track;
+  scrobbleState={started_at_unix:Math.floor(Date.now()/1000),played_ms:0,queued:false};
+  node("streamTools").hidden=track.kind!=="youtube";
   known.set(track.id,track);
   meter = null;
   text("badge",labels[track.kind] || "PUMP");
@@ -189,26 +202,22 @@ function selectTrack(track, remote=false) {
   node("attribution").hidden = !track.attribution;
   const url = asset(track.audio_url);
   if (track.kind !== "youtube" && url) {
-    audio.src = url;
+    audio.src = track.kind === "preview" ? "/preview/"+encodeURIComponent(track.id) : url;
     audio.playbackRate = rate;
   }
+  if(track.offlineBlob){const blobUrl=URL.createObjectURL(track.offlineBlob);audio.src=blobUrl;audio.addEventListener("emptied",()=>URL.revokeObjectURL(blobUrl),{once:true});}
   audio.load();
   updateButtons();
   if (node("queueSheet").open) renderQueue();
-  loadLyrics(track);
+  if(localOnly)node("lyricsBox").replaceChildren(element("p","plain-lyrics",track.offlineLyrics||"Текст не сохранён."));else loadLyrics(track);
 }
 cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback").hidden = false; });
 
 function requestPlay() {
+  startAudioGraph();
   if (selected?.kind === "youtube") {
-    if (!/^[A-Za-z0-9_-]{11}$/.test(selected.video_id || "")) return;
-    frame.src = "https://www.youtube-nocookie.com/embed/" + selected.video_id + "?autoplay=1";
-    frame.hidden = false;
-    mountedVideo = selected.id;
-    node("artBox").classList.add("video");
-    text("playerStatus","Видео управляется во встроенном плеере YouTube.");
-    updateButtons();
-    return;
+    if(!streamCandidates.length){loadStreams();return;}
+    playStreamCandidate();return;
   }
   if (!audio.getAttribute("src")) return;
   audio.play().catch(error => {
@@ -252,7 +261,7 @@ function step(delta) {
 function playPause() {
   if (isGuest()) return;
   if (!selected) { if (results.length) pick(0); else goTab("search"); return; }
-  if (selected.kind === "youtube") { if (!mountedVideo) requestPlay(); return; }
+  if (selected.kind === "youtube") { if (!audio.paused && !streamVideo.src) audio.pause(); else if(!streamVideo.paused)streamVideo.pause();else requestPlay(); return; }
   if (audio.paused) requestPlay(); else audio.pause();
 }
 function pressed(id,value,css) {
@@ -265,7 +274,7 @@ function updateButtons() {
   node("playBtn").setAttribute("aria-label",playing ? "Пауза" : "Играть");
   node("playBtn").disabled = guest || Boolean(mountedVideo);
   node("artBox").classList.toggle("playing",playing);
-  seek.disabled = guest || !selected || selected.kind === "youtube" || !Number.isFinite(audio.duration) || audio.duration <= 0;
+  seek.disabled = guest || !selected || (selected.kind === "youtube" && !audio.getAttribute("src")) || !Number.isFinite(audio.duration) || audio.duration <= 0;
   for (const control of document.querySelectorAll("[data-action=previous],[data-action=next],[data-action=shuffle],[data-action=repeat],[data-action=rate],[data-action=sleep]")) {
     control.disabled = guest || !selected;
   }
@@ -286,9 +295,16 @@ function setRate(value, button) {
   publishSoon();
 }
 function toggleSleep() {
-  if (sleep) { clearTimeout(sleep); sleep = null; }
-  else sleep = setTimeout(() => { audio.pause(); clearVideo(); toggleSleep(); updateButtons(); },900000);
-  text("sleepBtn",sleep ? "Таймер: 15 мин" : "Таймер: выкл.");
+  if (sleep) { clearInterval(sleep); sleep = null; audio.volume = 1; }
+  else {
+    const deadline = Date.now()+Number(node("sleepDuration").value)*60000;
+    sleep = setInterval(() => {
+      const remaining = deadline-Date.now();
+      audio.volume = Math.min(1,Math.max(0,remaining/15000));
+      if (remaining <= 0) { audio.pause(); clearVideo(); toggleSleep(); updateButtons(); }
+    },100);
+  }
+  text("sleepBtn",sleep ? "Отменить таймер" : "Таймер: выкл.");
   node("sleepBtn").classList.toggle("active",Boolean(sleep));
 }
 function settings(open) {
@@ -321,19 +337,21 @@ async function loadLyrics(track) {
   try {
     const data = await api("/api/lyrics/"+encodeURIComponent(track.id),{signal:request.signal});
     if (request.signal.aborted) return;
-    for (const row of (data.synced || "").split(/\r?\n/)) {
-      const match = /^\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+)$/u.exec(row);
-      if (match) lyricLines.push({time:Number(match[1])*60+Number(match[2])+Number("0."+(match[3]||"0")),text:match[4]});
+    if(data.document?.lines?.length) {
+      lyricLines=data.document.lines.filter(line=>line.start_ms!=null).map(line=>({...line,time:line.start_ms/1000}));
+    } else {
+      for (const row of (data.synced || "").split(/\r?\n/)) {
+        const match=/^\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+)$/u.exec(row);
+        if(match)lyricLines.push({time:Number(match[1])*60+Number(match[2])+Number("0."+(match[3]||"0")),text:match[4]});
+      }
     }
-    lyricLines.sort((a,b) => a.time-b.time);
-    box.replaceChildren();
-    if (!lyricLines.length) box.append(element("p","plain-lyrics",data.plain || "Текст не найден."));
-    else lyricLines.forEach((line,i) => {
-      const button = element("button","l-line",line.text);
-      button.type = "button";
-      button.dataset.action = "lyric";
-      button.dataset.value = String(i);
-      box.append(button);
+    lyricLines.sort((a,b)=>a.time-b.time);box.replaceChildren();
+    if(!lyricLines.length)box.append(element("p","plain-lyrics",data.plain||"Текст не найден."));
+    else lyricLines.forEach((line,i)=>{
+      const button=element("button","l-line");button.type="button";button.dataset.action="lyric";button.dataset.value=String(i);
+      if(line.singer_ids?.length){button.append(element("span","lyric-singer",line.singer_ids.join(" · ")));button.dataset.singerSide=line.alignment==="right"||line.alignment==="end"?"right":"left";}
+      if(line.words?.length)for(const word of line.words){const span=element("span","lyric-word",word.text);span.dataset.start=String(word.start_ms);span.dataset.end=String(word.end_ms??Infinity);button.append(span);}
+      else button.append(document.createTextNode(line.text));box.append(button);
     });
     syncLyrics();
   } catch (error) {
@@ -359,6 +377,9 @@ function sampleListening() {
     if (delta > 0 && delta < elapsed + 400) {
       if (!listening) listening = {track_id:meter.id,milliseconds:0};
       listening.milliseconds += Math.round(Math.min(elapsed,delta));
+      if(scrobbleState){scrobbleState.played_ms+=Math.round(Math.min(elapsed,delta));const duration_ms=Math.round(audio.duration*1000);
+        if(lastfmConnected&&!scrobbleState.queued&&duration_ms>30000&&scrobbleState.played_ms>=duration_ms/2){scrobbleState.queued=true;api("/api/lastfm/scrobble",{method:"POST",auth:true,body:{track_id:selected.id,duration_ms,started_at_unix:scrobbleState.started_at_unix,played_ms:scrobbleState.played_ms}}).catch(error=>text("settingsStatus",error.message));}
+      }
       if (listening.milliseconds >= 5000) finalizeListen();
     }
   }
@@ -601,6 +622,7 @@ document.addEventListener("click",event => {
       const box = node("artBox");
       box.classList.remove(styles[style]);
       style = (style+1)%styles.length;
+      node("designSelect").value = styles[style];
       box.classList.add(styles[style]);
       break;
     }
@@ -639,3 +661,159 @@ search().then(() => {
 });
 session().then(flushListens).catch(() => {});
 updateButtons();
+
+// Дополнительные возможности Mini App используют тот же элемент audio и сессию.
+let graph=null, remoteSocket=null, reconnectTimer=null;
+let eqGains=stored("pump.eq",Array(10).fill(0));
+if (!Array.isArray(eqGains)||eqGains.length!==10) eqGains=Array(10).fill(0);
+function startAudioGraph() {
+  if (!graph && window.AudioContext && (!audio.src || audio.src.startsWith("blob:") || new URL(audio.src).origin === location.origin)) {
+    const context=new AudioContext();
+    const source=context.createMediaElementSource(audio);
+    const preamp=context.createGain();
+    let tail=source;
+    const filters=PumpUX.frequencies.map(f=>{
+      const filter=context.createBiquadFilter();filter.type="peaking";filter.frequency.value=f;filter.Q.value=1.4;
+      tail.connect(filter);tail=filter;return filter;
+    });
+    tail.connect(preamp);preamp.connect(context.destination);graph={context,filters,preamp};applyEq();
+  }
+  graph?.context.resume().catch(()=>{});
+}
+function applyEq() {
+  if (!graph) return;
+  const enabled=node("eqEnabled").checked;
+  graph.filters.forEach((filter,i)=>filter.gain.setTargetAtTime(enabled?eqGains[i]:0,graph.context.currentTime,.02));
+  graph.preamp.gain.setTargetAtTime(enabled?Math.pow(10,Number(node("preamp").value)/20):1,graph.context.currentTime,.02);
+  text("preampValue",node("preamp").value+" dB");
+  persist("pump.eq",eqGains);
+}
+PumpUX.frequencies.forEach((frequency,i)=>{
+  const label=element("label","eq-band",frequency>=1000?frequency/1000+"k":String(frequency));
+  const slider=element("input");slider.type="range";slider.min="-12";slider.max="12";slider.step=".5";slider.value=String(eqGains[i]);slider.setAttribute("aria-label","EQ "+frequency+" Гц");
+  slider.addEventListener("input",()=>{eqGains[i]=Number(slider.value);applyEq();});label.append(slider);node("eqBands").append(label);
+});
+node("eqEnabled").addEventListener("change",()=>{startAudioGraph();applyEq();});
+node("preamp").addEventListener("input",applyEq);
+node("autoEqFile").addEventListener("change",async event=>{
+  try {const file=event.target.files[0];if(!file)return;if(file.size>1024*1024)throw new Error("Профиль больше 1 МБ.");
+    const raw=await file.text();
+    if(/^\s*(Preamp:|Filter\s)/mi.test(raw)){
+      startAudioGraph();const profile=await api("/api/eq/profile",{method:"POST",body:{text:raw,sample_rate:graph?.context.sampleRate||48000}});
+      node("eqEnabled").checked=true;node("preamp").value=String(Math.max(-24,Math.min(0,profile.preamp)));
+      eqGains=profile.bands.map(b=>b.enabled?b.gain:0);applyEq();
+      graph.filters.forEach((filter,i)=>{const band=profile.bands[i];filter.frequency.value=band.frequency;filter.Q.value=band.q;filter.type={Peak:"peaking",LowShelf:"lowshelf",HighShelf:"highshelf"}[band.kind];});
+      text("settingsStatus","Параметрический профиль применён.");return;
+    }
+    const profile=PumpUX.autoEq(raw);eqGains=profile.gains;node("preamp").value=String(profile.preamp);node("eqEnabled").checked=true;
+    node("eqBands").querySelectorAll("input").forEach((slider,i)=>slider.value=String(eqGains[i]));startAudioGraph();applyEq();text("settingsStatus","Профиль применён.");
+  }catch(error){text("settingsStatus",error.message);}
+});
+node("rateSelect").addEventListener("change",()=>{if(!isGuest())setRate(node("rateSelect").value);});
+node("designSelect").addEventListener("change",()=>{
+  node("artBox").classList.remove(...styles);style=styles.indexOf(node("designSelect").value);node("artBox").classList.add(styles[style]);
+});
+node("settingsSearch").addEventListener("input",()=>{
+  for(const section of node("settingsCategories").children)section.hidden=!PumpUX.matches(node("settingsSearch").value,section.textContent+" "+section.dataset.category);
+});
+function updatePalette(){const rgb=PumpUX.palette(cover);if(rgb&&node("dynamicPalette").checked)document.documentElement.style.setProperty("--cover-rgb",rgb);}
+cover.addEventListener("load",updatePalette);node("dynamicPalette").addEventListener("change",updatePalette);
+node("lyricsBlur").addEventListener("change",()=>node("lyricsBox").classList.toggle("lyrics-blur",node("lyricsBlur").checked));
+node("lyricsGlow").addEventListener("change",()=>node("lyricsBox").classList.toggle("lyrics-glow",node("lyricsGlow").checked));
+node("splitView").addEventListener("change",()=>document.body.classList.toggle("split-view",node("splitView").checked));
+node("fontSelect").addEventListener("change",()=>{const families={system:"inherit",serif:"Georgia, serif",mono:"monospace",custom:"PumpCustom"};node("lyricsBox").style.fontFamily=families[node("fontSelect").value];});
+node("fontFile").addEventListener("change",async event=>{
+ try{const file=event.target.files[0];if(!file)return;if(file.size>8*1024*1024)throw new Error("Шрифт больше 8 МБ.");const font=new FontFace("PumpCustom",await file.arrayBuffer());await font.load();document.fonts.add(font);node("fontSelect").querySelector('[value="custom"]').disabled=false;node("fontSelect").value="custom";node("lyricsBox").style.fontFamily="PumpCustom";}catch(error){text("settingsStatus",error.message);}
+});
+async function refreshOutputs(){
+ try{if(typeof audio.setSinkId!=="function"||!navigator.mediaDevices?.enumerateDevices)throw new Error("Выбор аудиовыхода недоступен в этом браузере.");
+ if(navigator.mediaDevices.selectAudioOutput){const device=await navigator.mediaDevices.selectAudioOutput();await audio.setSinkId(device.deviceId);}
+ const devices=await navigator.mediaDevices.enumerateDevices();node("outputDevice").replaceChildren(...devices.filter(d=>d.kind==="audiooutput").map(d=>{const option=element("option","",d.label||"Аудиовыход");option.value=d.deviceId;return option;}));text("outputStatus","");
+ }catch(error){text("outputStatus",error.message);}
+}
+node("outputDevice").addEventListener("change",()=>audio.setSinkId?.(node("outputDevice").value).catch(error=>text("outputStatus",error.message)));
+async function showDownloads(){
+ const records=await PumpUX.transaction("downloads","getAll");node("downloadsList").replaceChildren(...records.map(record=>{
+  const button=element("button","btn chip",record.track.title);button.addEventListener("click",()=>{if(isGuest())return;const url=URL.createObjectURL(record.blob);selectTrack({...record.track,audio_url:null});audio.src=url;audio.addEventListener("emptied",()=>URL.revokeObjectURL(url),{once:true});requestPlay();settings(false);});return button;
+ }));
+}
+document.addEventListener("click",async event=>{
+ const action=event.target.closest("[data-action]")?.dataset.action;
+ try{
+  if(action==="eq-reset"){eqGains.fill(0);node("preamp").value="0";node("eqBands").querySelectorAll("input").forEach(input=>input.value="0");applyEq();}
+  if(action==="output-refresh")await refreshOutputs();
+  if(action==="download"){if(!selected||!audio.src)throw new Error("Выбери аудиотрек.");text("offlineStatus","Скачиваем…");await PumpUX.download(selected,audio.src);await showDownloads();text("offlineStatus","Запись доступна на этом устройстве.");}
+  if(action==="offline-enable"){if(!navigator.serviceWorker)throw new Error("Офлайн-интерфейс недоступен.");await navigator.serviceWorker.register("/sw.js");text("offlineStatus","Офлайн-интерфейс включён.");await showDownloads();}
+  if(action==="history-clear"){persist("pump.history",[]);text("settingsStatus","История очищена.");}
+  if(action==="show-history"){results=stored("pump.history",[]);renderResults("История прослушиваний");settings(false);goTab("search");}
+ }catch(error){text("settingsStatus",error.message);text("offlineStatus",error.message);}
+});
+audio.addEventListener("playing",()=>{
+ if(!selected)return;const history=stored("pump.history",[]).filter(track=>track.id!==selected.id);history.unshift(selected);persist("pump.history",history.slice(0,100));
+ if(navigator.mediaSession){navigator.mediaSession.metadata=new MediaMetadata({title:selected.title,artist:selected.artist,artwork:asset(selected.artwork)?[{src:asset(selected.artwork)}]:[]});}
+});
+if(navigator.mediaSession){for(const [action,handler] of Object.entries({play:()=>requestPlay(),pause:()=>audio.pause(),nexttrack:()=>step(1),previoustrack:()=>step(-1),seekto:event=>{if(!isGuest()&&event)audio.currentTime=event.seekTime;}})){try{navigator.mediaSession.setActionHandler(action,event=>{if(!isGuest())handler(event);});}catch{}}}
+function connectControls(){
+ if(localOnly)return;
+ if(remoteSocket&&remoteSocket.readyState<=1)return;
+ const url=new URL("/ws/player",location.href);url.protocol=location.protocol==="https:"?"wss:":"ws:";
+ const socket=new WebSocket(url);remoteSocket=socket;
+ socket.addEventListener("open",()=>socket.send(JSON.stringify({type:"join",token})));
+ socket.addEventListener("close",()=>{if(remoteSocket===socket){remoteSocket=null;clearTimeout(reconnectTimer);reconnectTimer=setTimeout(connectControls,5000);}});
+ socket.addEventListener("message",async event=>{try{
+  const command=JSON.parse(event.data);if(command.type!=="command"||isGuest())return;
+  if(command.track_id){const track=known.get(command.track_id)||await api("/api/tracks/"+encodeURIComponent(command.track_id));queue.push(track);if(command.action==="play"){index=queue.length-1;selectTrack(track);}}
+  switch(command.action){case"play":requestPlay();break;case"pause":audio.pause();break;case"next":step(1);break;case"previous":step(-1);break;case"seek":if(Number.isFinite(audio.duration))audio.currentTime=Math.min(command.position_ms/1000,audio.duration);break;case"eq":if(Array.isArray(command.bands)&&command.bands.length===10){eqGains=command.bands;node("eqEnabled").checked=true;startAudioGraph();applyEq();node("eqBands").querySelectorAll("input").forEach((input,i)=>input.value=String(eqGains[i]));}break;}
+ }catch(error){text("playerStatus",error.message);}});
+}
+showDownloads().catch(()=>{});
+
+async function loadStreams(){
+ const track=selected,version=++streamSelection;text("playerStatus","Получаем форматы…");
+ try{const data=await api("/api/streams/"+encodeURIComponent(track.id)+"?mode="+node("streamMode").value+"&quality=balanced");if(version!==streamSelection||selected!==track)return;streamCandidates=data.streams;streamIndex=0;playStreamCandidate();}
+ catch(error){if(version===streamSelection)text("playerStatus",error.message);}
+}
+function playStreamCandidate(){
+ const stream=streamCandidates[streamIndex];if(!stream)return;
+ const video=node("streamMode").value==="video";const target=video?streamVideo:audio;
+ if(target.getAttribute("src")!==stream.url){audio.pause();streamVideo.pause();target.src=stream.url;}
+ streamVideo.hidden=!video;node("artBox").classList.toggle("video",video);
+ target.play().then(()=>text("playerStatus","")).catch(error=>{if(error.name!=="AbortError")text("playerStatus","Нажми Play, чтобы начать воспроизведение.");});
+}
+function fallbackStream(){if(selected?.kind!=="youtube")return;if(++streamIndex<streamCandidates.length){playStreamCandidate();}else{text("playerStatus","Доступные форматы закончились. Можно открыть YouTube.");streamCandidates=[];}}
+audio.addEventListener("error",fallbackStream);streamVideo.addEventListener("error",fallbackStream);
+node("streamMode").addEventListener("change",()=>{streamCandidates=[];audio.pause();streamVideo.pause();loadStreams();});
+document.addEventListener("click",event=>{if(event.target.closest('[data-action="youtube-embed"]')&&selected?.video_id){audio.pause();streamVideo.pause();streamVideo.hidden=true;frame.src="https://www.youtube-nocookie.com/embed/"+selected.video_id+"?autoplay=1";frame.hidden=false;mountedVideo=selected.id;node("artBox").classList.add("video");updateButtons();}});
+function animateLyrics(){if(currentTab==="lyrics"||document.body.classList.contains("split-view")){syncLyrics();const time=audio.currentTime*1000;for(const word of node("lyricsBox").querySelectorAll(".lyric-word")){word.classList.toggle("current",time>=Number(word.dataset.start)&&time<Number(word.dataset.end));word.classList.toggle("sung",time>=Number(word.dataset.end));}}requestAnimationFrame(animateLyrics);}
+requestAnimationFrame(animateLyrics);
+
+node("localOnly").checked=localOnly;
+node("localOnly").addEventListener("change",()=>{localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
+
+let canvasUrl=null;
+node("canvasFile").addEventListener("change",async event=>{try{const file=event.target.files[0];if(!file)return;if(!["video/mp4","video/webm"].includes(file.type)||file.size>32*1024*1024)throw new Error("Для Canvas нужен MP4/WebM до 32 МБ.");if(canvasUrl)URL.revokeObjectURL(canvasUrl);canvasUrl=URL.createObjectURL(file);const video=node("canvasVideo");video.src=canvasUrl;video.hidden=false;await video.play();}catch(error){text("settingsStatus",error.message);}});
+node("iconPreset").addEventListener("change",()=>{document.body.dataset.icons=node("iconPreset").value;persist("pump.iconPreset",node("iconPreset").value);});
+document.body.dataset.icons=stored("pump.iconPreset","default");node("iconPreset").value=document.body.dataset.icons;
+
+document.addEventListener("click",async event=>{if(event.target.closest('[data-action="lastfm-connect"]')){try{await session();await api("/api/lastfm/connect",{method:"POST",auth:true,body:{session_key:node("lastfmKey").value}});node("lastfmKey").value="";lastfmConnected=true;text("settingsStatus","Last.fm подключён к текущей сессии.");}catch(error){text("settingsStatus",error.message);}}});
+
+document.addEventListener("click",async event=>{
+ const action=event.target.closest("[data-action]")?.dataset.action;
+ if(!["spotify-connect","playlist-import"].includes(action))return;
+ try{
+  await session();
+  if(action==="spotify-connect"){
+   const result=await api("/api/spotify/authorize",{method:"POST",auth:true});
+   const url=new URL(result.url);if(url.protocol!=="https:"||url.hostname!=="accounts.spotify.com")throw new Error("Неверный адрес авторизации.");
+   const link=element("a","","Авторизоваться в Spotify");link.href=url.href;link.target="_blank";link.rel="noopener";node("settingsStatus").replaceChildren(link);return;
+  }
+  const link=node("importLink").value.trim();const url=new URL(link);
+  const source=url.hostname==="open.spotify.com"?"spotify":url.hostname==="music.apple.com"?"apple":null;
+  if(!source)throw new Error("Нужна ссылка Spotify или Apple Music.");
+  text("settingsStatus","Переносим треки…");const imported=await api("/api/import",{method:"POST",auth:true,body:{source,link}});
+  const matched=imported.filter(track=>track.resolution.status==="matched");
+  const tracks=[];for(const track of matched)tracks.push(await api("/api/tracks/"+encodeURIComponent(track.resolution.id)));
+  if(tracks.length){queue=tracks;index=0;selectTrack(queue[0]);renderQueue();}
+  text("settingsStatus","Добавлено в очередь: "+tracks.length+". Без однозначного совпадения: "+(imported.length-tracks.length)+".");
+ }catch(error){text("settingsStatus",error.message);}
+});

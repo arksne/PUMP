@@ -1,0 +1,25 @@
+;; Минимальный провайдер: проверяет вход в памяти и возвращает JSON ABI v1.
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\22abi_version\22:1,\22tracks\22:[{\22id\22:\22fixture-1\22,\22title\22:\22Fixture song\22,\22artist\22:\22WASM\22,\22kind\22:\22full\22,\22duration_ms\22:123000,\22artwork\22:\22https://example.com/cover.jpg\22}]}")
+  (data (i32.const 1024) "{\22abi_version\22:1,\22candidates\22:[{\22url\22:\22https://example.com/song.mp3\22,\22quality\22:\22high\22,\22mime_type\22:\22audio/mpeg\22,\22bitrate_kbps\22:320},{\22url\22:\22https://example.com/song.flac\22,\22quality\22:\22lossless\22,\22mime_type\22:\22audio/flac\22,\22bitrate_kbps\22:null}]}")
+  (func (export "plugin_abi_version") (result i32) i32.const 1)
+  (func (export "alloc") (param $len i32) (result i32)
+    (if (i32.gt_u (local.get $len) (i32.const 4096)) (then unreachable))
+    i32.const 4096)
+  (func $check (param $ptr i32) (param $len i32)
+    (if (i32.ne (local.get $ptr) (i32.const 4096)) (then unreachable))
+    (if (i32.lt_u (local.get $len) (i32.const 30)) (then unreachable))
+    (if (i32.ne (i32.load8_u (local.get $ptr)) (i32.const 123)) (then unreachable))
+    (if (i32.ne (i32.load8_u (i32.sub (i32.add (local.get $ptr) (local.get $len)) (i32.const 1))) (i32.const 125)) (then unreachable)))
+  (func (export "search") (param $ptr i32) (param $len i32) (result i64)
+    (call $check (local.get $ptr) (local.get $len))
+    (if (i32.ne (i32.load8_u offset=26 (local.get $ptr)) (i32.const 110)) (then unreachable))
+    ;; Старшие 32 бита — адрес; младшие — длина JSON в байтах.
+    i64.const 163)
+  (func (export "resolve") (param $ptr i32) (param $len i32) (result i64)
+    (call $check (local.get $ptr) (local.get $len))
+    (if (i32.ne (i32.load8_u offset=29 (local.get $ptr)) (i32.const 102)) (then unreachable))
+    (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const 238)))
+
+)
