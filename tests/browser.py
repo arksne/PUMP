@@ -276,6 +276,7 @@ class PlayerTest(unittest.TestCase):
             self.assertTrue(page.evaluate("() => graph.ready"))
             page.locator("#concertMode").check()
             expect(page.locator("#pitchSemitones")).to_be_enabled()
+            self.assertEqual(page.evaluate("async()=>{const context=graph.context;const original=context.setSinkId;let routed=null;context.setSinkId=async id=>{routed=id;};try{await setOutputDevice('test-speakers');return routed;}finally{context.setSinkId=original;}}"),"test-speakers")
             page.locator("#eqEnabled").check()
             page.locator("#autoEqFile").set_input_files({"name":"headphones.txt","mimeType":"text/plain","buffer":b"Preamp: -4 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1.4"})
             expect(page.locator("#settingsStatus")).to_have_text("Параметрический профиль применён.")

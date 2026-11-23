@@ -695,6 +695,7 @@ function startAudioGraph() {
       tail.connect(filter);tail=filter;return filter;
     });
     tail.connect(preamp);preamp.connect(context.destination);graph={context,source,filters,preamp,rustDsp:null};applyEq();graph.ready=attachRustDsp(graph);
+    if(audio.sinkId&&typeof context.setSinkId==="function")context.setSinkId(audio.sinkId).catch(error=>text("outputStatus",error.message));
   }
   graph?.context.resume().catch(()=>{});
 }
@@ -744,13 +745,24 @@ node("fontSelect").addEventListener("change",()=>{const families={system:"inheri
 node("fontFile").addEventListener("change",async event=>{
  try{const file=event.target.files[0];if(!file)return;if(file.size>8*1024*1024)throw new Error("Шрифт больше 8 МБ.");const font=new FontFace("PumpCustom",await file.arrayBuffer());await font.load();document.fonts.add(font);node("fontSelect").querySelector('[value="custom"]').disabled=false;node("fontSelect").value="custom";node("lyricsBox").style.fontFamily="PumpCustom";}catch(error){text("settingsStatus",error.message);}
 });
+async function setOutputDevice(deviceId){
+ // После подключения DSP звук идёт через AudioContext, поэтому переключается его выход.
+ if(graph){
+  if(typeof graph.context.setSinkId!=="function")throw new Error("Этот браузер не умеет менять выход WebAudio.");
+  await graph.context.setSinkId(deviceId);
+ }else{
+  if(window.AudioContext&&typeof AudioContext.prototype.setSinkId!=="function")throw new Error("Этот браузер не умеет менять выход WebAudio.");
+  if(typeof audio.setSinkId!=="function")throw new Error("Выбор аудиовыхода недоступен в этом браузере.");
+  await audio.setSinkId(deviceId);
+ }
+}
 async function refreshOutputs(){
- try{if(typeof audio.setSinkId!=="function"||!navigator.mediaDevices?.enumerateDevices)throw new Error("Выбор аудиовыхода недоступен в этом браузере.");
- if(navigator.mediaDevices.selectAudioOutput){const device=await navigator.mediaDevices.selectAudioOutput();await audio.setSinkId(device.deviceId);}
+ try{if(!navigator.mediaDevices?.enumerateDevices)throw new Error("Выбор аудиовыхода недоступен в этом браузере.");
+ if(navigator.mediaDevices.selectAudioOutput){const device=await navigator.mediaDevices.selectAudioOutput();await setOutputDevice(device.deviceId);}
  const devices=await navigator.mediaDevices.enumerateDevices();node("outputDevice").replaceChildren(...devices.filter(d=>d.kind==="audiooutput").map(d=>{const option=element("option","",d.label||"Аудиовыход");option.value=d.deviceId;return option;}));text("outputStatus","");
  }catch(error){text("outputStatus",error.message);}
 }
-node("outputDevice").addEventListener("change",()=>audio.setSinkId?.(node("outputDevice").value).catch(error=>text("outputStatus",error.message)));
+node("outputDevice").addEventListener("change",()=>setOutputDevice(node("outputDevice").value).catch(error=>text("outputStatus",error.message)));
 async function showDownloads(){
  const records=await PumpUX.transaction("downloads","getAll");node("downloadsList").replaceChildren(...records.map(record=>{
   const button=element("button","btn chip",record.track.title);button.addEventListener("click",()=>{if(isGuest())return;const url=URL.createObjectURL(record.blob);selectTrack({...record.track,audio_url:null});audio.src=url;audio.addEventListener("emptied",()=>URL.revokeObjectURL(url),{once:true});requestPlay();settings(false);});return button;
