@@ -212,7 +212,7 @@ class PlayerTest(unittest.TestCase):
             wait_for_audio(guest, "audio => audio.paused")
             host_position = host.locator("#audio").evaluate("(audio) => audio.currentTime")
             guest_position = guest.locator("#audio").evaluate("(audio) => audio.currentTime")
-            self.assertLess(abs(host_position - guest_position), 0.35)
+            self.assertLess(abs(host_position - guest_position), 0.2)
 
             host.locator("#tabStats").click()
             expect(host.locator("#statsTracks")).to_contain_text("North Loop")

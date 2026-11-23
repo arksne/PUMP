@@ -549,7 +549,7 @@ function syncRoom() {
   if (!isGuest() || !room.desired || selected?.id !== room.desired.track_id) return;
   const target = room.desired;
   const position = (target.position_ms+(target.playing ? Math.max(0,Date.now()+room.skew-target.at_ms)*target.rate : 0))/1000;
-  if (Number.isFinite(audio.duration) && (Math.abs(audio.currentTime-position) > .25 || audio.paused && !target.playing)) {
+  if (Number.isFinite(audio.duration) && (Math.abs(audio.currentTime-position) > .15 || audio.paused && !target.playing)) {
     const next = Math.min(Math.max(0,position),audio.duration);
     if (Math.abs(audio.currentTime-next) > .05) audio.currentTime = next;
   }

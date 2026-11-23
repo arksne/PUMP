@@ -14,6 +14,7 @@ pub(crate) struct Scrobbles {
     accounts: Arc<Mutex<HashMap<String, Arc<Mutex<Account>>>>>,
 }
 struct Account {
+    session_hash: String,
     client: LastFmClient,
     queue: ScrobbleQueue,
 }
@@ -42,6 +43,9 @@ pub(crate) async fn connect(
         .ok_or_else(|| ApiError::invalid("Нужно настроить LASTFM_API_KEY."))?;
     let shared_secret = crate::setting("LASTFM_SHARED_SECRET")
         .ok_or_else(|| ApiError::invalid("Нужно настроить LASTFM_SHARED_SECRET."))?;
+    let session_hash = hex::encode(Sha256::digest(
+        format!("{owner}\0{}", input.session_key).as_bytes(),
+    ));
     let client = LastFmClient::new(LastFmCredentials {
         api_key,
         shared_secret,
@@ -50,15 +54,26 @@ pub(crate) async fn connect(
     .map_err(|_| ApiError::invalid("Некорректные настройки Last.fm."))?;
     let mut accounts = app.scrobbles.accounts.lock().await;
     if let Some(account) = accounts.get(&owner) {
-        account.lock().await.client = client;
+        let mut account = account.lock().await;
+        if account.session_hash != session_hash {
+            account.queue =
+                ScrobbleQueue::open(app.scrobbles.root.join(format!("{session_hash}.json")))
+                    .map_err(|_| ApiError::unavailable("Не удалось открыть очередь Last.fm."))?;
+            account.session_hash = session_hash;
+        }
+        account.client = client;
     } else {
-        let path = app.scrobbles.root.join(format!(
-            "{}.json",
-            hex::encode(Sha256::digest(owner.as_bytes()))
-        ));
+        let path = app.scrobbles.root.join(format!("{session_hash}.json"));
         let queue = ScrobbleQueue::open(path)
             .map_err(|_| ApiError::unavailable("Не удалось открыть очередь Last.fm."))?;
-        accounts.insert(owner, Arc::new(Mutex::new(Account { client, queue })));
+        accounts.insert(
+            owner,
+            Arc::new(Mutex::new(Account {
+                session_hash,
+                client,
+                queue,
+            })),
+        );
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -110,7 +125,7 @@ pub(crate) async fn record(
             now,
         )
         .map_err(|_| ApiError::invalid("Событие Last.fm отклонено."))?;
-    let Account { client, queue } = &mut *account;
+    let Account { client, queue, .. } = &mut *account;
     let report = queue
         .flush(client, now, 10)
         .await

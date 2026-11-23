@@ -90,6 +90,7 @@ pub fn write_tags_with_cover(
             .open(&tmp)?;
         let mut input = std::fs::File::open(path)?;
         std::io::copy(&mut input, &mut output)?;
+        std::io::Seek::rewind(&mut output)?;
         tag.save_to(&mut output, WriteOptions::default())?;
         output.set_permissions(input.metadata()?.permissions())?;
         output.sync_all()?;
