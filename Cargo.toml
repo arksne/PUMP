@@ -8,6 +8,10 @@ version = "0.2.0"
 edition = "2024"
 description = "PUMP music player and Telegram Mini App"
 
+[features]
+default = []
+smb = ["telegram-bridge/smb"]
+
 [dependencies]
 anyhow = "1"
 telegram-bridge = { path = "crates/telegram-bridge" }

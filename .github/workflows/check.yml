@@ -23,6 +23,14 @@ jobs:
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: DSP_WASM=web/pkg/pump_dsp.wasm node --test web/dsp.test.mjs
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo check -p ui-liquid-glass --no-default-features --features dsp-only --target wasm32-unknown-unknown --locked
+      - run: cargo build --manifest-path providers/soundhelix/Cargo.toml --target wasm32-unknown-unknown --release --locked
+      - run: node --test providers/soundhelix/provider.test.mjs
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: python3 -m venv /tmp/pump-tests
       - run: /tmp/pump-tests/bin/pip install playwright==1.62.0

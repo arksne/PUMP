@@ -17,13 +17,17 @@
 | `telegram-bridge` | Сервер Axum, бот, webhook, пульт Mini App, импорты и распознавание |
 | `ui-liquid-glass` | Ресурсы приложения и Rust/WASM-утилиты интерфейса |
 
-Браузер воспроизводит аудио и управляет WebAudio через JavaScript. Нативный DSP предоставляет Rust API. Дополнительные возможности включаются Cargo features `audio-dsp-engine/native-output`, `audio-dsp-engine/dlna`, `library-storage/smb`, `social-integrations/discord`. Для ALSA на Linux нужен пакет `libasound2-dev`.
+Браузер воспроизводит аудио через WebAudio. Эквалайзер, Concert Mode и live pitch-shift выполняются в Rust/WASM внутри AudioWorklet. Управление интерфейсом пока написано на JavaScript. Нативный DSP также предоставляет Rust API. Дополнительные возможности включаются Cargo features `audio-dsp-engine/native-output`, `audio-dsp-engine/dlna`, `library-storage/smb`, `social-integrations/discord`. Для ALSA на Linux нужен пакет `libasound2-dev`.
 
 ## Дополнительные интеграции
 
 `PUMP_YOUTUBE_COOKIES` включает сессионную подпись запросов InnerTube. Сервер перебирает клиентские профили и возвращает доступные прямые форматы через `/api/streams/{id}`. Форматы с шифрованной подписью, ограничения аккаунта и блокировки со стороны YouTube могут потребовать встроенный видеоплеер. Cookies хранятся в секретах окружения.
 
-`SPOTIFY_CLIENT_ID` включает OAuth через POST `/api/spotify/authorize`. В Spotify Developer Dashboard нужно зарегистрировать публичный callback `/api/spotify/callback` на адресе PUMP. POST `/api/import` принимает `source` (`spotify` или `apple`) и `link`. Ответ сохраняет позиции исходных треков и явно показывает неоднозначные совпадения. Подключение Spotify пока хранится в памяти процесса. Публичные ссылки Apple обрабатываются в пределах доступных метаданных iTunes Lookup, для полноценного каталога плейлистов требуется MusicKit.
+Для импорта Spotify свой Client ID не обязателен. В настройках библиотеки вставь публичную ссылку плейлиста. Сервер читает доступные метаданные Spotify Embed и ищет совпадения в каталоге PUMP. Spotify иногда скрывает часть списка или не отдаёт Embed. В таком случае экспортируй список через [Exportify](https://exportify.app/) и выбери CSV в настройках PUMP. CSV сохраняет порядок, повторы и названия на русском. Импорт переносит список треков, аудио воспроизводится из доступных источников PUMP.
+
+POST `/api/import` принимает `source` (`spotify` или `apple`) и `link`, POST `/api/import/csv` — файл CSV. Ответ `202` содержит `job_id`; GET `/api/import/{job_id}` показывает прогресс и итог сопоставления. Запросы требуют сессию пользователя. Интерфейс показывает неоднозначные совпадения и возможное усечение Embed.
+
+`SPOTIFY_CLIENT_ID` дополнительно включает OAuth через POST `/api/spotify/authorize`. Для него нужно зарегистрировать публичный callback `/api/spotify/callback` в Spotify Developer Dashboard. Подключение хранится в памяти процесса. Публичные ссылки Apple обрабатываются в пределах метаданных iTunes Lookup; для полноценного импорта плейлистов требуется MusicKit.
 
 `LASTFM_API_KEY` и `LASTFM_SHARED_SECRET` задают приложение Last.fm. Пользователь подключает свой session key в настройках библиотеки. Ключ сессии хранится в памяти, а события на повторную отправку — в локальном файле пользователя.
 
@@ -31,9 +35,29 @@
 
 Команды `/play название`, `/queue название`, `/pause`, `/next`, `/previous`, `/seek секунды`, `/eq десять_значений` управляют открытой Mini App той же Telegram-сессии. `/stats` и `/stats month` отправляют PNG-карточку с итогами. Проверка этих команд требует подключения Telegram и действий пользователя в Mini App.
 
-Загрузки сервера доступны через `/api/downloads`, POST `/api/downloads/{id}` и авторизованный GET `/api/downloads/{id}/file`. Клиентская кнопка скачивания сохраняет аудио на устройстве в IndexedDB. Настройка «Только офлайн» отключает запросы к API и оставляет локальные записи. Постоянное облачное хранилище подключается на заключительном этапе проекта.
+Загрузки сервера доступны через `/api/downloads`, POST `/api/downloads/{id}` и авторизованный GET `/api/downloads/{id}/file`. Клиентская кнопка скачивания сохраняет аудио на устройстве в IndexedDB. «Скачать очередь» сохраняет весь текущий список, включая импортированный плейлист, пропускает уже загруженные записи и позволяет остановить загрузку. Настройка «Только офлайн» отключает запросы к API и оставляет локальные записи. Постоянное облачное хранилище подключается на заключительном этапе проекта.
 
-WASM-провайдеры описаны в [ABI](crates/plugin-spine/ABI.md). Файлы провайдеров загружаются из `PUMP_PLUGIN_DIR` при запуске. Пример WAT в тестах — проверочный модуль.
+WASM-провайдеры описаны в [ABI](crates/plugin-spine/ABI.md). Файлы загружаются из `PUMP_PLUGIN_DIR` при запуске и появляются в списке источников поиска. Сервер выдаёт отдельные временные ссылки, поддерживает HTTP Range и разрешает только хосты из `PUMP_PLUGIN_ALLOWED_HOSTS`. Плеер пробует следующий формат при ошибке. Настройка и рабочий пример SoundHelix приведены в [руководстве по плагинам](providers/README.md).
+
+### NAS
+
+Укажи `PUMP_NAS_CONFIG=./nas.json` и создай файл конфигурации. `owners` содержит владельцев, которым разрешён доступ. Для Telegram используй свой числовой ID в формате `telegram:123456789`.
+
+```json
+[
+  {
+    "protocol": "webdav",
+    "id": "home",
+    "name": "Домашняя музыка",
+    "base": "https://nas.example.com/music/",
+    "username": "music",
+    "password": "пароль NAS",
+    "owners": ["telegram:123456789"]
+  }
+]
+```
+
+После перезапуска открой сетевую библиотеку в настройках и введи относительный путь, например `Albums/Track.flac`. Аудио передаётся частями через сервер, без полного скачивания. В конфигурации можно задать `protocol: "smb"`, `server`, `share`, `username`, `password` и тот же `owners`; такая сборка требует `cargo build --release --features smb`. Сервер должен иметь сетевой доступ к NAS. Пароли остаются в файле конфигурации сервера.
 
 ## Пересборка браузерного WASM
 
@@ -44,7 +68,11 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.130 --locked
 cargo build -p ui-liquid-glass --target wasm32-unknown-unknown --release
 wasm-bindgen --target web --out-dir web/pkg --out-name ui_liquid_glass target/wasm32-unknown-unknown/release/ui_liquid_glass.wasm
+cargo build -p ui-liquid-glass --release --target wasm32-unknown-unknown --no-default-features --features dsp-only
+cp target/wasm32-unknown-unknown/release/ui_liquid_glass.wasm web/pkg/pump_dsp.wasm
 ```
+
+Первый модуль предоставляет утилиты интерфейса. Второй не требует JS-импортов и обрабатывает PCM в AudioWorklet. После изменения файлов `web/pkg` пересобери сервер, поскольку ресурсы встраиваются в бинарный файл.
 
 ## Запуск на компьютере
 
@@ -107,6 +135,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --workspace --locked
 cargo build --locked
+DSP_WASM=web/pkg/pump_dsp.wasm node --test web/dsp.test.mjs
 python3 -m venv .venv
 .venv/bin/pip install playwright==1.62.0
 .venv/bin/python -m playwright install chromium
@@ -117,8 +146,10 @@ python3 -m venv .venv
 
 ## Границы текущей реализации
 
-Реализованы серверные и нативные API перечисленных модулей. Плеер Telegram использует WebAudio, а его Rust/WASM-модуль выполняет поиск настроек и обработку палитры. Для полноценного Rust/WASM-клиента и использования нативного DSP в браузерном аудиотракте потребуется дальнейшая интеграция.
+Rust/WASM уже обрабатывает браузерный аудиотракт — EQ/AutoEq, Concert Mode и pitch-shift. Управление экраном и очередью остаётся на JavaScript. Живой pitch-shift использует ограниченный зерновой алгоритм; автономный WSOLA доступен в Rust API.
 
-Для живых проверок внешних аккаунтов нужны Spotify Client ID, данные приложения и сессии Last.fm, токен AudD. Проверка SMB/DLNA/Discord и аудиоустройств требует доступных устройств или локальных сервисов. Сборка соответствующих Cargo features проверяется отдельно от подключения к ним.
+Публичный импорт Spotify и CSV работают без Client ID. Для проверки OAuth личного аккаунта, Last.fm и AudD нужны соответствующие данные. SMB/DLNA/Discord и аудиоустройства проверяются сборкой отдельно от подключения к реальному оборудованию.
 
-В YouTube ещё требуется поддержка зашифрованных signatureCipher/n-signature и связанных ограничений источника. Комнаты совместного прослушивания сейчас синхронизируют аудиопотоки каталога, а точность 200 мс требует измерений на пользовательской сети. Встраивание полного нативного Automix/DJ/Concert Mode в Mini App, интерфейсы NAS и менеджера плагинов, полноценный импорт плейлистов Apple через MusicKit и системные виджеты остаются следующими задачами. Постоянная облачная БД и файловое хранилище подключаются на заключительном этапе.
+В YouTube ещё требуется поддержка signatureCipher/n-signature и связанных ограничений источника. Точность комнат 200 мс проверена локально и требует измерений на пользовательской сети. Нативные Crossfade/Automix/DJ API предстоит встроить в браузерное воспроизведение. Полное приложение на Rust/WASM, импорт плейлистов Apple через MusicKit, каталог настроений, полноценный файловый браузер NAS, сетевые host-вызовы для динамических WASM-провайдеров и системные виджеты остаются в работе. Постоянная облачная БД и файловое хранилище подключаются на заключительном этапе.
+
+Подробная сверка с ТЗ находится в [статусе реализации](docs/IMPLEMENTATION_STATUS.md). Использованные open-source проекты и лицензии перечислены в [OPEN_SOURCE.md](OPEN_SOURCE.md).

@@ -57,6 +57,16 @@ impl SmbStorage {
     }
 }
 impl SmbFile {
+    pub async fn len(&self) -> Result<u64> {
+        use smb::GetLen;
+        self.file
+            .get_len()
+            .await
+            .map_err(|_| Error::Invalid("SMB metadata failed".into()))
+    }
+    pub async fn is_empty(&self) -> Result<bool> {
+        Ok(self.len().await? == 0)
+    }
     pub async fn read_at(&self, offset: u64, max_bytes: usize) -> Result<Vec<u8>> {
         if max_bytes > 4 * 1024 * 1024 {
             return Err(Error::Limit("SMB chunk".into()));

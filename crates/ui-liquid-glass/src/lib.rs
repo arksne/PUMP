@@ -1,16 +1,18 @@
 //! Общие ресурсы сервера и небольшие утилиты браузерного клиента.
 
+pub mod dsp;
+
 pub const INDEX_HTML: &str = include_str!("../../../index.html");
 pub const APP_JS: &str = include_str!("../../../web/app.js");
 pub const UI_JS: &str = include_str!("../../../web/ui.js");
 pub const UI_CSS: &str = include_str!("../../../web/ui.css");
 pub const SERVICE_WORKER_JS: &str = include_str!("../../../web/sw.js");
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "web-bindings"))]
 use wasm_bindgen::prelude::*;
 
 /// Все слова запроса должны встречаться в описании настройки.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", feature = "web-bindings"), wasm_bindgen)]
 pub fn settings_match(query: &str, description: &str) -> bool {
     let description = description.to_lowercase();
     query
@@ -20,7 +22,7 @@ pub fn settings_match(query: &str, description: &str) -> bool {
 }
 
 /// Непрозрачные пиксели обложки дают спокойный цвет для стекла.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(all(target_arch = "wasm32", feature = "web-bindings"), wasm_bindgen)]
 pub fn palette_rgb(rgba: &[u8]) -> u32 {
     let mut sum = [0_u64; 3];
     let mut count = 0_u64;
@@ -45,6 +47,11 @@ pub fn palette_rgb(rgba: &[u8]) -> u32 {
 pub const WASM_JS: &str = include_str!("../../../web/pkg/ui_liquid_glass.js");
 #[cfg(not(target_arch = "wasm32"))]
 pub const WASM_BYTES: &[u8] = include_bytes!("../../../web/pkg/ui_liquid_glass_bg.wasm");
+
+pub const DSP_CLIENT_JS: &str = include_str!("../../../web/dsp-client.js");
+pub const DSP_WORKLET_JS: &str = include_str!("../../../web/dsp-worklet.js");
+#[cfg(not(target_arch = "wasm32"))]
+pub const DSP_BYTES: &[u8] = include_bytes!("../../../web/pkg/pump_dsp.wasm");
 
 #[cfg(test)]
 mod tests {

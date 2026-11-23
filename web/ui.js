@@ -75,10 +75,14 @@ window.PumpUX = (() => {
       tx.onabort = tx.onerror = () => reject(tx.error || request.error || new Error("Ошибка локального хранилища."));
     });
   }
-  async function download(track, source) {
+  // Состояние запросов и временные URL не входят в офлайн-метаданные.
+  function trackMetadata(track){
+    return Object.fromEntries(Object.entries(track).filter(([key])=>!key.startsWith("_")&&key!=="offlineBlob"));
+  }
+  async function download(track, source, {signal}={}) {
     const url = new URL(source, location.href);
     if (url.origin !== location.origin || !/^https?:$/.test(url.protocol)) throw new Error("Скачивание доступно только для локального аудио или серверного proxy.");
-    const response = await fetch(url);
+    const response = await fetch(url,{signal});
     if (!response.ok) throw new Error("Не удалось скачать аудио: HTTP " + response.status);
     const type = response.headers.get("content-type") || "";
     if (!/^(audio|video)\//.test(type) && !type.startsWith("application/octet-stream")) throw new Error("Сервер вернул не аудиофайл.");
@@ -92,11 +96,12 @@ window.PumpUX = (() => {
       chunks.push(value);
     }
     let lyrics=null,artwork=null;
-    try{const response=await fetch("/api/lyrics/"+encodeURIComponent(track.id));if(response.ok)lyrics=await response.json();}catch{}
-    if(track.artwork&&new URL(track.artwork,location.href).origin===location.origin){try{const response=await fetch(track.artwork);if(response.ok&&Number(response.headers.get("content-length"))<=8*1024*1024)artwork=await response.blob();}catch{}}
-    const record = {id:track.id, track:{...track,offlineLyrics:lyrics?.plain||lyrics?.synced}, lyrics, artwork, blob:new Blob(chunks,{type}), size, at:Date.now()};
+    try{const response=await fetch("/api/lyrics/"+encodeURIComponent(track.id),{signal});if(response.ok)lyrics=await response.json();}catch{}
+    if(track.artwork&&new URL(track.artwork,location.href).origin===location.origin){try{const response=await fetch(track.artwork,{signal});if(response.ok&&Number(response.headers.get("content-length"))<=8*1024*1024)artwork=await response.blob();}catch{}}
+    signal?.throwIfAborted();
+    const record = {id:track.id, track:{...trackMetadata(track),offlineLyrics:lyrics?.plain||lyrics?.synced}, lyrics, artwork, blob:new Blob(chunks,{type}), size, at:Date.now()};
     await transaction("downloads", "put", record);
     return record;
   }
-  return {frequencies, wasmReady, matches, palette, autoEq, transaction, download};
+  return {frequencies, wasmReady, matches, palette, autoEq, transaction, download, trackMetadata};
 })();

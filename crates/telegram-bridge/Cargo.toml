@@ -3,7 +3,12 @@ name = "telegram-bridge"
 version = "0.2.0"
 edition = "2024"
 
+[features]
+default = []
+smb = ["library-storage/smb"]
+
 [dependencies]
+futures-util = "0.3"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 dotenvy = "0.15"

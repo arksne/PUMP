@@ -6,6 +6,8 @@ mod cards;
 mod controls;
 mod imports;
 mod library;
+mod nas_api;
+mod plugin_media;
 mod plugins;
 mod recognition;
 mod rooms;
@@ -38,7 +40,9 @@ pub(crate) struct App {
     telegram: Option<Arc<telegram::Settings>>,
     lyrics: lyrics_engine::LyricsClient,
     library: library::Libraries,
+    nas: nas_api::NetworkStorage,
     plugins: Arc<plugin_spine::PluginRegistry>,
+    plugin_media: plugin_media::PluginMedia,
     imports: imports::Imports,
     scrobbles: scrobbling::Scrobbles,
 }
@@ -125,8 +129,11 @@ pub async fn run() -> Result<()> {
     let plugins = Arc::new(plugins::load(
         setting("PUMP_PLUGIN_DIR").map(PathBuf::from),
     )?);
+    let nas = nas_api::NetworkStorage::load(setting("PUMP_NAS_CONFIG").map(PathBuf::from))?;
     let app = App {
+        nas,
         plugins,
+        plugin_media: plugin_media::PluginMedia::default(),
         imports: imports::Imports::default(),
         scrobbles: scrobbling::Scrobbles::new(data.join("lastfm")),
         catalog,
@@ -220,7 +227,37 @@ fn router(app: App) -> Router {
             }),
         )
         .route("/healthz", get(|| async { Json(json!({"ok": true})) }))
+        .route(
+            "/assets/dsp-client.js",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                    ui_liquid_glass::DSP_CLIENT_JS,
+                )
+            }),
+        )
+        .route(
+            "/assets/dsp-worklet.js",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                    ui_liquid_glass::DSP_WORKLET_JS,
+                )
+            }),
+        )
+        .route(
+            "/assets/ui-liquid-glass/pkg/pump_dsp.wasm",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/wasm")],
+                    ui_liquid_glass::DSP_BYTES,
+                )
+            }),
+        )
         .route("/api/search", get(search))
+        .route("/api/nas", get(nas_api::list))
+        .route("/api/nas/{id}/ticket", post(nas_api::ticket))
+        .route("/nas/stream/{token}", get(nas_api::stream))
         .route("/api/lastfm/connect", post(scrobbling::connect))
         .route("/api/lastfm/scrobble", post(scrobbling::record))
         .route(
@@ -230,6 +267,15 @@ fn router(app: App) -> Router {
         .route("/api/spotify/authorize", post(imports::authorize))
         .route("/api/spotify/callback", get(imports::callback))
         .route("/api/import", post(imports::playlist))
+        .route("/api/import/{id}", get(imports::status))
+        .route(
+            "/api/import/csv",
+            post(imports::csv).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/addon/stream/{id}/{lease}/{index}",
+            get(plugin_media::stream),
+        )
         .route("/api/providers", get(plugins::list))
         .route("/api/providers/{id}/search", get(plugins::search))
         .route("/api/providers/{id}/resolve", post(plugins::resolve))

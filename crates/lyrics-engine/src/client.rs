@@ -23,6 +23,14 @@ impl LyricsClient {
         title: &str,
         duration_ms: Option<u64>,
     ) -> Result<LyricsResult, reqwest::Error> {
+        if artist.trim().is_empty() || title.trim().is_empty() {
+            return Ok(LyricsResult {
+                synced: None,
+                plain: None,
+                document: None,
+                sources: Vec::new(),
+            });
+        }
         let timed = async {
             let r = self
                 .http

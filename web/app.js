@@ -16,6 +16,8 @@ let localOnly=stored("pump.localOnly",false);
 let room = null;
 let scrobbleState=null,lastfmConnected=false;
 let streamCandidates=[], streamIndex=0, streamSelection=0;
+let providerSelection=0;
+const providerNames=new Map();
 const streamVideo=node("streamVideo");
 
 function stored(key, fallback) {
@@ -121,7 +123,10 @@ async function search() {
   searchRequest = request;
   text("sStatus", "Ищем…");
   try {
-    const data = await api("/api/search?" + new URLSearchParams({q:query, source}), {signal:request.signal});
+    const path=source.startsWith("plugin:")
+      ? "/api/providers/"+encodeURIComponent(source.slice(7))+"/search?"+new URLSearchParams({q:query})
+      : "/api/search?"+new URLSearchParams({q:query,source});
+    const data = await api(path, {signal:request.signal});
     if (request.signal.aborted) return;
     results = data.tracks;
     results.forEach(track => known.set(track.id, track));
@@ -152,7 +157,7 @@ function trackButton(track, i, action) {
   }
   const info = element("span","item-info");
   info.append(element("span","item-t",track.title),
-    element("span","item-s",[track.artist,labels[track.kind],track.source].filter(Boolean).join(" · ")));
+    element("span","item-s",[track.artist,labels[track.kind],track.provider ? (providerNames.get(track.provider.provider_id)||"Дополнение") : track.source].filter(Boolean).join(" · ")));
   row.append(artwork,info,element("span","","›"));
   return row;
 }
@@ -181,6 +186,8 @@ function selectTrack(track, remote=false) {
   audio.removeAttribute("src");
   clearVideo();
   streamSelection++;streamCandidates=[];
+  providerSelection++;
+  if(track.provider){track._providerRecovery=false;track._providerPosition=0;}
   if(canvasUrl){node("canvasVideo").pause();node("canvasVideo").removeAttribute("src");node("canvasVideo").hidden=true;URL.revokeObjectURL(canvasUrl);canvasUrl=null;}
   selected = track;
   scrobbleState={started_at_unix:Math.floor(Date.now()/1000),played_ms:0,queued:false};
@@ -202,7 +209,7 @@ function selectTrack(track, remote=false) {
   node("attribution").hidden = !track.attribution;
   const url = asset(track.audio_url);
   if (track.kind !== "youtube" && url) {
-    audio.src = track.kind === "preview" ? "/preview/"+encodeURIComponent(track.id) : url;
+    audio.src = track.kind === "preview" && track.source === "iTunes" ? "/preview/"+encodeURIComponent(track.id) : url;
     audio.playbackRate = rate;
   }
   if(track.offlineBlob){const blobUrl=URL.createObjectURL(track.offlineBlob);audio.src=blobUrl;audio.addEventListener("emptied",()=>URL.revokeObjectURL(blobUrl),{once:true});}
@@ -215,9 +222,16 @@ cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback
 
 function requestPlay() {
   startAudioGraph();
+  if(isGuest()&&(!room.sound||!room.desired?.playing))return;
   if (selected?.kind === "youtube") {
     if(!streamCandidates.length){loadStreams();return;}
     playStreamCandidate();return;
+  }
+  if(selected?.provider && !selected.offlineBlob &&
+     (!selected._providerResolvedAt || Date.now()-selected._providerResolvedAt>10*60*1000)) {
+    selected._providerPosition=Math.max(0,audio.currentTime||0);
+    resolveProviderTrack(selected).then(ready=>{if(ready)requestPlay();}).catch(error=>text("playerStatus",error.message));
+    return;
   }
   if (!audio.getAttribute("src")) return;
   audio.play().catch(error => {
@@ -285,7 +299,7 @@ function like() {
   if (!selected) return;
   if (!favorites.delete(selected.id)) favorites.add(selected.id);
   persist("pump.favorites",[...favorites]);
-  persist("pump.favorite-tracks",[...favorites].map(id => known.get(id)).filter(Boolean));
+  persist("pump.favorite-tracks",[...favorites].map(id => known.get(id)).filter(Boolean).map(PumpUX.trackMetadata));
   updateButtons();
 }
 function setRate(value, button) {
@@ -308,6 +322,7 @@ function toggleSleep() {
   node("sleepBtn").classList.toggle("active",Boolean(sleep));
 }
 function settings(open) {
+  if(open)startAudioGraph();
   node("sheet").hidden = !open;
   node("sheet").classList.toggle("open",open);
   node("backdrop").classList.toggle("open",open);
@@ -538,6 +553,8 @@ async function applyRemote(state,playback) {
     const track = known.get(playback.track_id) || await api("/api/tracks/"+encodeURIComponent(playback.track_id));
     if (room !== state || request !== state.trackRequest || state.desired?.track_id !== track.id) return;
     selectTrack(track,true);
+    if(track.provider)await resolveProviderTrack(track);
+    if(room!==state||request!==state.trackRequest)return;
     syncRoom();
   } catch (error) {
     if (room === state) text("roomStatus",error.message);
@@ -599,6 +616,7 @@ audio.addEventListener("ended",() => {
   else { updateButtons(); publishSoon(); }
 });
 audio.addEventListener("error",() => {
+  if(selected?.provider && !selected.offlineBlob){recoverProviderTrack().catch(error=>text("playerStatus",error.message));return;}
   if (selected?.kind !== "youtube" && audio.getAttribute("src")) text("playerStatus","Аудиофайл недоступен.");
 });
 document.addEventListener("click",event => {
@@ -673,10 +691,10 @@ function startAudioGraph() {
     const preamp=context.createGain();
     let tail=source;
     const filters=PumpUX.frequencies.map(f=>{
-      const filter=context.createBiquadFilter();filter.type="peaking";filter.frequency.value=f;filter.Q.value=1.4;
+      const filter=context.createBiquadFilter();filter.type="peaking";filter.frequency.value=Math.min(f,context.sampleRate*.45);filter.Q.value=1.4;
       tail.connect(filter);tail=filter;return filter;
     });
-    tail.connect(preamp);preamp.connect(context.destination);graph={context,filters,preamp};applyEq();
+    tail.connect(preamp);preamp.connect(context.destination);graph={context,source,filters,preamp,rustDsp:null};applyEq();graph.ready=attachRustDsp(graph);
   }
   graph?.context.resume().catch(()=>{});
 }
@@ -687,6 +705,7 @@ function applyEq() {
   graph.preamp.gain.setTargetAtTime(enabled?Math.pow(10,Number(node("preamp").value)/20):1,graph.context.currentTime,.02);
   text("preampValue",node("preamp").value+" dB");
   persist("pump.eq",eqGains);
+  if(graph.rustDsp?.available)graph.rustDsp.configure(rustDspSettings(graph)).catch(error=>text("dspStatus",error.message));
 }
 PumpUX.frequencies.forEach((frequency,i)=>{
   const label=element("label","eq-band",frequency>=1000?frequency/1000+"k":String(frequency));
@@ -702,7 +721,7 @@ node("autoEqFile").addEventListener("change",async event=>{
       startAudioGraph();const profile=await api("/api/eq/profile",{method:"POST",body:{text:raw,sample_rate:graph?.context.sampleRate||48000}});
       node("eqEnabled").checked=true;node("preamp").value=String(Math.max(-24,Math.min(0,profile.preamp)));
       eqGains=profile.bands.map(b=>b.enabled?b.gain:0);applyEq();
-      graph.filters.forEach((filter,i)=>{const band=profile.bands[i];filter.frequency.value=band.frequency;filter.Q.value=band.q;filter.type={Peak:"peaking",LowShelf:"lowshelf",HighShelf:"highshelf"}[band.kind];});
+      graph.filters.forEach((filter,i)=>{const band=profile.bands[i];filter.frequency.value=band.frequency;filter.Q.value=band.q;filter.type={Peak:"peaking",LowShelf:"lowshelf",HighShelf:"highshelf"}[band.kind];});applyEq();
       text("settingsStatus","Параметрический профиль применён.");return;
     }
     const profile=PumpUX.autoEq(raw);eqGains=profile.gains;node("preamp").value=String(profile.preamp);node("eqEnabled").checked=true;
@@ -810,10 +829,161 @@ document.addEventListener("click",async event=>{
   const link=node("importLink").value.trim();const url=new URL(link);
   const source=url.hostname==="open.spotify.com"?"spotify":url.hostname==="music.apple.com"?"apple":null;
   if(!source)throw new Error("Нужна ссылка Spotify или Apple Music.");
-  text("settingsStatus","Переносим треки…");const imported=await api("/api/import",{method:"POST",auth:true,body:{source,link}});
-  const matched=imported.filter(track=>track.resolution.status==="matched");
-  const tracks=[];for(const track of matched)tracks.push(await api("/api/tracks/"+encodeURIComponent(track.resolution.id)));
-  if(tracks.length){queue=tracks;index=0;selectTrack(queue[0]);renderQueue();}
-  text("settingsStatus","Добавлено в очередь: "+tracks.length+". Без однозначного совпадения: "+(imported.length-tracks.length)+".");
+  text("settingsStatus","Читаем плейлист…");const job=await api("/api/import",{method:"POST",auth:true,body:{source,link}});
+  await waitForImport(job);
  }catch(error){text("settingsStatus",error.message);}
+});
+
+document.addEventListener("click",async event=>{
+ const action=event.target.closest("[data-action]")?.dataset.action;
+ if(!["nas-list","nas-play"].includes(action))return;
+ try{await session();
+ if(action==="nas-list"){const servers=await api("/api/nas",{auth:true});node("nasServer").replaceChildren(...servers.map(server=>{const option=element("option","",server.name);option.value=server.id;return option;}));text("settingsStatus",servers.length?"Выбери сервер и укажи путь к записи.":"Для этой сессии NAS-серверы ещё не настроены.");}
+ else{if(isGuest())throw new Error("Сначала выйди из комнаты слушателя.");const id=node("nasServer").value;if(!id)throw new Error("Сначала выбери NAS-сервер.");const result=await api("/api/nas/"+encodeURIComponent(id)+"/ticket",{method:"POST",auth:true,body:{path:node("nasPath").value}});known.set(result.track.id,result.track);queue.push(result.track);index=queue.length-1;selectTrack(result.track);settings(false);goTab("player");requestPlay();publishSoon();}
+ }catch(error){text("settingsStatus",error.message);}
+});
+
+let importGeneration=0;
+async function waitForImport(job){
+ const generation=++importGeneration;
+ while(generation===importGeneration){
+  const state=await api("/api/import/"+encodeURIComponent(job.job_id),{auth:true});
+  text("settingsStatus","Сопоставлено "+state.completed+" из "+state.total+"."+(state.notice?" "+state.notice:""));
+  if(state.status==="completed"){
+   const imported=state.rows||[],matched=imported.filter(track=>track.resolution.status==="matched");
+   const tracks=[];for(const track of matched)tracks.push(await api("/api/tracks/"+encodeURIComponent(track.resolution.id)));
+   if(generation!==importGeneration)return;
+   if(tracks.length){queue=tracks;index=0;selectTrack(queue[0]);renderQueue();}
+   text("settingsStatus","Добавлено в очередь: "+tracks.length+". Без однозначного совпадения: "+(imported.length-tracks.length)+"."+(state.notice?" "+state.notice:""));return;
+  }
+  await new Promise(resolve=>setTimeout(resolve,1000));
+ }
+}
+node("importCsv").addEventListener("change",async event=>{
+ try{const file=event.target.files[0];if(!file)return;if(file.size>16*1024*1024)throw new Error("CSV больше 16 МБ.");await session();
+  const response=await fetch("/api/import/csv",{method:"POST",headers:{Authorization:"Bearer "+token,"Content-Type":"text/csv; charset=utf-8"},body:file});
+  const body=await response.json();if(!response.ok)throw new Error(body.error||"Не удалось импортировать CSV.");await waitForImport(body);
+ }catch(error){text("settingsStatus",error.message);}
+});
+
+function rustDspSettings(current){return {
+ eqEnabled:node("eqEnabled").checked,preampDb:Number(node("preamp").value),
+ concertMode:node("concertMode").checked,pitchSemitones:Number(node("pitchSemitones").value),
+ bands:current.filters.map((filter,i)=>({kind:{peaking:"Peak",lowshelf:"LowShelf",highshelf:"HighShelf"}[filter.type]||"Peak",frequency:filter.frequency.value,gain:eqGains[i],q:filter.Q.value,enabled:true}))
+};}
+async function attachRustDsp(current){
+ try{
+  const {createRustDsp}=await import("/assets/dsp-client.js");
+  const dsp=await createRustDsp(current.context,current.source,{settings:rustDspSettings(current),onError:error=>{
+   if(current.rustDsp){current.rustDsp.destroy();current.rustDsp=null;current.source.connect(current.filters[0]);current.preamp.connect(current.context.destination);}
+   node("concertMode").checked=false;node("concertMode").disabled=true;node("pitchSemitones").disabled=true;text("dspStatus",error.message);
+  }});
+  if(!dsp.available){text("dspStatus",dsp.error?.message||"Расширенный DSP недоступен.");return false;}
+  current.source.disconnect(current.filters[0]);current.preamp.disconnect(current.context.destination);
+  dsp.output.connect(current.context.destination);current.rustDsp=dsp;
+  node("concertMode").disabled=false;node("pitchSemitones").disabled=false;text("dspStatus","");applyEq();return true;
+ }catch(error){text("dspStatus",error.message);return false;}
+}
+node("concertMode").addEventListener("change",()=>{startAudioGraph();applyEq();});
+node("pitchSemitones").addEventListener("input",()=>{text("pitchValue",node("pitchSemitones").value+" полутонов");applyEq();});
+audio.preservesPitch=true;
+audio.addEventListener("emptied",()=>graph?.rustDsp?.reset().catch(()=>{}));
+
+
+// Каждое разрешение создаёт отдельные ссылки. Перемотка не смешивает байты разных форматов.
+async function loadProviders(){
+ if(localOnly)return;
+ try{
+  const providers=await api("/api/providers");
+  const group=document.createElement("optgroup");group.label="Дополнения";
+  for(const id of providers){providerNames.set(id,id);const option=document.createElement("option");option.value="plugin:"+id;option.textContent=id;group.append(option);}
+  if(group.children.length)node("source").append(group);
+ }catch{}
+}
+async function resolveProviderTrack(track){
+ const generation=providerSelection;
+ if(track._providerResolving&&track._providerGeneration===generation)return track._providerResolving;
+ track._providerGeneration=generation;
+ const task=(async()=>{
+  text("playerStatus","Подключаем источник…");
+  const data=await api("/api/providers/"+encodeURIComponent(track.provider.provider_id)+"/resolve",{
+   method:"POST",body:{abi_version:1,track_id:track.provider.track_id,quality:{preferred:"high",prefer_lossless:true,allow_fallback:true}}
+  });
+  if(selected!==track||generation!==providerSelection)return false;
+  Object.assign(track,data.track);
+  track._providerUrls=data.urls;track._providerIndex=0;track._providerResolvedAt=Date.now();
+  useProviderCandidate(track);known.set(track.id,track);return true;
+ })();
+ track._providerResolving=task;
+ try{return await task;}finally{if(track._providerResolving===task)delete track._providerResolving;}
+}
+function useProviderCandidate(track){
+ const url=track._providerUrls?.[track._providerIndex];
+ if(!url)throw new Error("Источник не предоставил доступный аудиофайл.");
+ const position=Math.max(0,track._providerPosition||0),generation=providerSelection;
+ audio.src=url;audio.playbackRate=rate;
+ if(position>0)audio.addEventListener("loadedmetadata",()=>{
+  if(selected===track&&generation===providerSelection&&Number.isFinite(audio.duration))audio.currentTime=Math.min(position,Math.max(0,audio.duration-.1));
+ },{once:true});
+ audio.load();
+}
+async function recoverProviderTrack(){
+ const track=selected;
+ if(!track?.provider||track._providerResolving)return;
+ track._providerPosition=Math.max(audio.currentTime||0,track._providerPosition||0);
+ if(track._providerUrls&&track._providerIndex+1<track._providerUrls.length){
+  track._providerIndex++;text("playerStatus","Пробуем другой формат…");useProviderCandidate(track);requestPlay();return;
+ }
+ if(!track._providerRecovery){
+  track._providerRecovery=true;
+  if(await resolveProviderTrack(track))requestPlay();
+ }else text("playerStatus","Доступные форматы источника недоступны. Попробуй позже.");
+}
+loadProviders();
+
+
+// Очередь импортированного плейлиста скачивается последовательно, с явным итогом.
+let queueDownload=null;
+async function queueDownloadSources(track,signal){
+ if(track.provider){
+  const data=await api("/api/providers/"+encodeURIComponent(track.provider.provider_id)+"/resolve",{
+   method:"POST",signal,body:{abi_version:1,track_id:track.provider.track_id,quality:{preferred:"high",prefer_lossless:true,allow_fallback:true}}
+  });return data.urls;
+ }
+ if(track.kind==="youtube"){
+  const data=await api("/api/streams/"+encodeURIComponent(track.id)+"?mode=audio&quality=balanced",{signal});return data.streams.map(stream=>stream.url);
+ }
+ if(track.source==="iTunes"&&track.kind==="preview")return ["/preview/"+encodeURIComponent(track.id)];
+ return track.audio_url?[track.audio_url]:[];
+}
+node("cancelQueueDownload").addEventListener("click",()=>queueDownload?.abort());
+node("downloadQueueButton").addEventListener("click",async()=>{
+ if(queueDownload)return;
+ const tracks=[...new Map(queue.map(track=>[track.id,track])).values()];
+ if(!tracks.length){text("offlineStatus","Добавь треки в очередь.");return;}
+ if(localOnly){text("offlineStatus","Для загрузки выключи режим «Только офлайн».");return;}
+ const controller=new AbortController();queueDownload=controller;
+ node("downloadQueueButton").disabled=true;node("cancelQueueDownload").hidden=false;
+ let saved=0,skipped=0;const failed=[];
+ try{
+  for(const [i,track] of tracks.entries()){
+   controller.signal.throwIfAborted();text("offlineStatus","Загрузка "+(i+1)+" из "+tracks.length+" · "+track.title);
+   if(await PumpUX.transaction("downloads","get",track.id)){skipped++;continue;}
+   try{
+    const urls=await queueDownloadSources(track,controller.signal);
+    let complete=false,lastError=new Error("Нет доступного аудиопотока.");
+    for(const url of urls){
+     try{await PumpUX.download(PumpUX.trackMetadata(track),url,{signal:controller.signal});complete=true;break;}
+     catch(error){controller.signal.throwIfAborted();lastError=error;}
+    }
+    if(!complete)throw lastError;
+    saved++;
+   }catch(error){controller.signal.throwIfAborted();failed.push(track.title+" — "+error.message);}
+  }
+  text("offlineStatus","Сохранено: "+saved+". Уже на устройстве: "+skipped+". Ошибок: "+failed.length+"."+(failed.length?" "+failed.join("; "):""));
+ }catch(error){text("offlineStatus",controller.signal.aborted?"Загрузка остановлена. Сохранено: "+saved+".":error.message);}
+ finally{
+  queueDownload=null;node("downloadQueueButton").disabled=false;node("cancelQueueDownload").hidden=true;
+  await showDownloads();
+ }
 });

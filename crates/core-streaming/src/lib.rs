@@ -51,6 +51,13 @@ pub enum Kind {
     Youtube,
 }
 
+/// Ссылка на исходную запись позволяет обновлять временный поток дополнения.
+#[derive(Clone, Serialize)]
+pub struct ProviderRef {
+    pub provider_id: String,
+    pub track_id: String,
+}
+
 #[derive(Clone, Serialize)]
 pub struct Track {
     pub id: String,
@@ -63,6 +70,8 @@ pub struct Track {
     pub video_id: Option<String>,
     pub source: &'static str,
     pub attribution: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderRef>,
 }
 
 #[derive(Clone)]
@@ -137,6 +146,7 @@ impl Catalog {
             video_id: None,
             source: "SoundHelix",
             attribution: Some("Music by SoundHelix — https://www.soundhelix.com"),
+            provider: None,
         }));
         let fixed = full
             .iter()
@@ -257,6 +267,27 @@ impl Catalog {
         response
             .body(Body::from_stream(upstream.bytes_stream()))
             .map_err(|_| ApiError::unavailable("Некорректный ответ источника."))
+    }
+
+    /// Временные записи NAS и провайдеров доступны комнатам и статистике по стабильному ID.
+    pub async fn register_track(&self, track: Track) -> Result<(), ApiError> {
+        if track.id.is_empty()
+            || track.id.len() > 64
+            || track.title.len() > 2048
+            || track.artist.len() > 2048
+        {
+            return Err(ApiError::invalid("Некорректные метаданные трека."));
+        }
+        let mut lookup = self.lookup.write().await;
+        lookup.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6 * 3600));
+        if lookup.len() >= 8192 {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Каталог временных записей заполнен.",
+            ));
+        }
+        lookup.insert(track.id.clone(), (Instant::now(), track));
+        Ok(())
     }
 
     pub fn local_count(&self) -> usize {
@@ -499,6 +530,7 @@ impl Catalog {
                     video_id: None,
                     source: "iTunes",
                     attribution: None,
+                    provider: None,
                 })
             })
             .collect())
@@ -654,6 +686,7 @@ fn youtube_track(id: &str, title: &str, artist: &str) -> Track {
         video_id: Some(id.into()),
         source: "YouTube",
         attribution: None,
+        provider: None,
     }
 }
 
@@ -779,6 +812,7 @@ fn scan(start: &Path) -> Result<Scanned> {
                 video_id: None,
                 source: "Медиатека",
                 attribution: None,
+                provider: None,
             });
             files.insert(id, LocalFile { path, cover });
         }

@@ -1,0 +1,21 @@
+[package]
+name = "pump-provider-soundhelix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Гостевой модуль собирается отдельно от серверного Wasmtime.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

@@ -22,3 +22,5 @@ pub fn http_client() -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
+
+pub mod spotify_public;

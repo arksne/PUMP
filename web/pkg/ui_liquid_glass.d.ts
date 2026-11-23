@@ -16,6 +16,17 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly palette_rgb: (a: number, b: number) => number;
+    readonly pump_dsp_abi_version: () => number;
+    readonly pump_dsp_capacity: () => number;
+    readonly pump_dsp_config_len: () => number;
+    readonly pump_dsp_config_ptr: () => number;
+    readonly pump_dsp_configure: () => number;
+    readonly pump_dsp_create: (a: number) => number;
+    readonly pump_dsp_destroy: () => void;
+    readonly pump_dsp_pcm_ptr: () => number;
+    readonly pump_dsp_process: (a: number) => number;
+    readonly pump_dsp_reset: () => number;
+    readonly pump_dsp_rms: (a: number) => number;
     readonly settings_match: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_export: (a: number, b: number) => number;

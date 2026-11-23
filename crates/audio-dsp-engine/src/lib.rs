@@ -57,3 +57,5 @@ pub(crate) fn db_gain(db: f64) -> f64 {
 
 #[cfg(feature = "dlna")]
 pub mod dlna;
+
+pub mod wasm;
