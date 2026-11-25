@@ -2,6 +2,9 @@
 use crate::{Lyrics, ParseOptions, parse, parse_plain};
 use serde::Serialize;
 use serde_json::Value;
+use std::time::Duration;
+/// Резервный источник не задерживает быстрый ответ: каждый источник ограничен своим сроком.
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(6);
 #[derive(Clone)]
 pub struct LyricsClient {
     http: reqwest::Client,
@@ -32,13 +35,17 @@ impl LyricsClient {
             });
         }
         let timed = async {
-            let r = self
-                .http
-                .get("https://lrclib.net/api/get")
-                .query(&[("artist_name", artist), ("track_name", title)])
-                .send()
-                .await?;
-            r.error_for_status()?.json::<Value>().await
+            let r = tokio::time::timeout(
+                SOURCE_TIMEOUT,
+                self.http
+                    .get("https://lrclib.net/api/get")
+                    .query(&[("artist_name", artist), ("track_name", title)])
+                    .send(),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            r.error_for_status().ok()?.json::<Value>().await.ok()
         };
         let plain = async {
             let url = format!(
@@ -46,8 +53,11 @@ impl LyricsClient {
                 component(artist),
                 component(title)
             );
-            let r = self.http.get(url).send().await?;
-            r.error_for_status()?.json::<Value>().await
+            let r = tokio::time::timeout(SOURCE_TIMEOUT, self.http.get(url).send())
+                .await
+                .ok()?
+                .ok()?;
+            r.error_for_status().ok()?.json::<Value>().await.ok()
         };
         let (timed, plain) = tokio::join!(timed, plain);
         let mut result = LyricsResult {
@@ -56,7 +66,7 @@ impl LyricsClient {
             document: None,
             sources: Vec::new(),
         };
-        if let Ok(value) = timed {
+        if let Some(value) = timed {
             result.synced = text(&value, "syncedLyrics");
             result.plain = text(&value, "plainLyrics");
             if result.synced.is_some() || result.plain.is_some() {
@@ -64,7 +74,7 @@ impl LyricsClient {
             }
         }
         if result.plain.is_none()
-            && let Ok(value) = plain
+            && let Some(value) = plain
         {
             result.plain = text(&value, "lyrics");
             if result.plain.is_some() {

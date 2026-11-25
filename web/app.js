@@ -338,6 +338,7 @@ function goTab(tab) {
   }
   if (tab === "stats") showStats();
   if (tab === "lyrics") syncLyrics(true);
+  refreshLyricAnim();
   syncBack();
 }
 
@@ -361,14 +362,15 @@ async function loadLyrics(track) {
       }
     }
     lyricLines.sort((a,b)=>a.time-b.time);box.replaceChildren();
+    lyricWords=[];lyricWordIndex=-1;
     if(!lyricLines.length)box.append(element("p","plain-lyrics",data.plain||"Текст не найден."));
     else lyricLines.forEach((line,i)=>{
       const button=element("button","l-line");button.type="button";button.dataset.action="lyric";button.dataset.value=String(i);
       if(line.singer_ids?.length){button.append(element("span","lyric-singer",line.singer_ids.join(" · ")));button.dataset.singerSide=line.alignment==="right"||line.alignment==="end"?"right":"left";}
-      if(line.words?.length)for(const word of line.words){const span=element("span","lyric-word",word.text);span.dataset.start=String(word.start_ms);span.dataset.end=String(word.end_ms??Infinity);button.append(span);}
+      if(line.words?.length)for(const word of line.words){const span=element("span","lyric-word",word.text);const start=Number(word.start_ms),end=word.end_ms==null?Infinity:Number(word.end_ms);span.dataset.start=String(start);span.dataset.end=String(end);button.append(span);lyricWords.push({el:span,start,end});}
       else button.append(document.createTextNode(line.text));box.append(button);
     });
-    syncLyrics();
+    syncLyrics();refreshLyricAnim();
   } catch (error) {
     if (!request.signal.aborted) box.replaceChildren(element("p","status",error.message));
   }
@@ -604,11 +606,12 @@ seek.addEventListener("input",() => {
 });
 audio.addEventListener("timeupdate",() => { updateTimeline(); syncLyrics(); sampleListening(); });
 audio.addEventListener("loadedmetadata",() => { updateTimeline(); updateButtons(); syncRoom(); });
-audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); });
-audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); });
-audio.addEventListener("seeking",() => { meter = null; });
+audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
+audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); stopLyricAnim(); });
+audio.addEventListener("seeking",() => { meter = null; lyricWordIndex=-1; });
 audio.addEventListener("seeked",publishSoon);
 audio.addEventListener("ended",() => {
+  stopLyricAnim();
   finalizeListen();
   if (isGuest()) return;
   if (repeat) { audio.currentTime = 0; requestPlay(); }
@@ -814,9 +817,43 @@ function playStreamCandidate(){
 function fallbackStream(){if(selected?.kind!=="youtube")return;if(++streamIndex<streamCandidates.length){playStreamCandidate();}else{text("playerStatus","Доступные форматы закончились. Можно открыть YouTube.");streamCandidates=[];}}
 audio.addEventListener("error",fallbackStream);streamVideo.addEventListener("error",fallbackStream);
 node("streamMode").addEventListener("change",()=>{streamCandidates=[];audio.pause();streamVideo.pause();loadStreams();});
+document.addEventListener("visibilitychange",() => { refreshLyricAnim(); });
 document.addEventListener("click",event=>{if(event.target.closest('[data-action="youtube-embed"]')&&selected?.video_id){audio.pause();streamVideo.pause();streamVideo.hidden=true;frame.src="https://www.youtube-nocookie.com/embed/"+selected.video_id+"?autoplay=1";frame.hidden=false;mountedVideo=selected.id;node("artBox").classList.add("video");updateButtons();}});
-function animateLyrics(){if(currentTab==="lyrics"||document.body.classList.contains("split-view")){syncLyrics();const time=audio.currentTime*1000;for(const word of node("lyricsBox").querySelectorAll(".lyric-word")){word.classList.toggle("current",time>=Number(word.dataset.start)&&time<Number(word.dataset.end));word.classList.toggle("sung",time>=Number(word.dataset.end));}}requestAnimationFrame(animateLyrics);}
-requestAnimationFrame(animateLyrics);
+// Подсветка слов идёт только при видимом тексте и играющем аудио.
+// Слова кэшируются один раз при загрузке; каждый кадр трогает лишь окрестность текущей позиции.
+let lyricWords=[],lyricWordIndex=-1,lyricRaf=0;
+function lyricVisible(){return currentTab==="lyrics"||document.body.classList.contains("split-view");}
+function stopLyricAnim(){if(lyricRaf){cancelAnimationFrame(lyricRaf);lyricRaf=0;}}
+function refreshLyricAnim(){
+  if(!lyricWords.length||audio.paused||document.hidden||!lyricVisible()){stopLyricAnim();return;}
+  if(!lyricRaf)lyricRaf=requestAnimationFrame(tickLyricWords);
+}
+function tickLyricWords(){
+  lyricRaf=0;
+  if(audio.paused||document.hidden||!lyricWords.length||!lyricVisible())return;
+  const time=audio.currentTime*1000;
+  let i=lyricWordIndex;
+  if(i<0||i>=lyricWords.length||time<lyricWords[i].start||time>=lyricWords[i].end){
+    let lo=0,hi=lyricWords.length;
+    while(lo<hi){const mid=(lo+hi)>>1;if(lyricWords[mid].start<=time)lo=mid+1;else hi=mid;}
+    i=lo-1;
+  }
+  const changed=[];
+  if(lyricWordIndex!==i){
+    for(let k=Math.min(lyricWordIndex,i)-1;k<=Math.max(lyricWordIndex,i)+1;k++)if(k>=0&&k<lyricWords.length)changed.push(k);
+    lyricWordIndex=i;
+  }else{
+    if(i>=0)changed.push(i);
+    if(i+1<lyricWords.length&&lyricWords[i+1].start<=time+200)changed.push(i+1);
+  }
+  for(const k of changed){
+    const word=lyricWords[k];
+    word.el.classList.toggle("current",time>=word.start&&time<word.end);
+    word.el.classList.toggle("sung",time>=word.end);
+  }
+  syncLyrics();
+  lyricRaf=requestAnimationFrame(tickLyricWords);
+}
 
 node("localOnly").checked=localOnly;
 node("localOnly").addEventListener("change",()=>{localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
