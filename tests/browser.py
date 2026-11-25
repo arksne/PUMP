@@ -136,6 +136,22 @@ class PlayerTest(unittest.TestCase):
         self.assertEqual((stats["tracks"], stats["milliseconds"]), (1, 1200))
         self.assertEqual(stats["top_artists"][0]["title"], track["artist"])
 
+    def test_external_sources_shape_and_guards(self):
+        _, _, data = self.request("/api/search?source=spotify&q=North")
+        body = json.loads(data)
+        self.assertEqual(body["tracks"], [])
+        self.assertIn("SPOTIFY_CLIENT", body["notice"])
+        with self.assertRaises(HTTPError) as invalid:
+            self.request("/source/sc/abc")
+        self.assertEqual(invalid.exception.code, 404)
+        _, _, data = self.request("/api/search?source=soundcloud&q=North")
+        body = json.loads(data)
+        self.assertIsInstance(body["tracks"], list)
+        for track in body["tracks"]:
+            self.assertTrue(track["id"].startswith("sc-"))
+            self.assertTrue(track["audio_url"].startswith("/source/sc/"))
+            self.assertEqual((track["kind"], track["source"]), ("full", "SoundCloud"))
+
     def test_nas_ticket_confines_access_and_streams_ranges(self):
         _,_,session=self.request("/api/session",body={})
         token=json.loads(session)["token"]
