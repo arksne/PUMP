@@ -175,15 +175,34 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
 /// соединение и слот семафора вечно. Таймаут рвёт стрим целиком.
 fn nas_body<S>(
     stream: S,
-) -> impl futures_util::StreamExt<Item = Result<axum::body::Bytes, std::io::Error>>
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
 where
-    S: futures_util::StreamExt<Item = Result<axum::body::Bytes, reqwest::Error>>,
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin,
 {
     use futures_util::StreamExt as _;
-    stream.timeout(Duration::from_secs(30)).map(|chunk| {
-        chunk
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "простой потока NAS"))?
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+    futures_util::stream::unfold((stream, false), |(mut stream, mut done)| async move {
+        if done {
+            return None;
+        }
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Err(_) => {
+                done = true;
+                Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "простой потока NAS",
+                    )),
+                    (stream, done),
+                ))
+            }
+            Ok(None) => None,
+            Ok(Some(item)) => {
+                let item = item
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+                let failed = item.is_err();
+                Some((item, (stream, done || failed)))
+            }
+        }
     })
 }
 
