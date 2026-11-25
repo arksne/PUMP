@@ -55,7 +55,7 @@ Play/pause/resume/stop, seek/scrub/progress, volume через системны�
 - Поиск `All`: локальное + SoundCloud параллельно (лимит 6 с) + Spotify-совпадения (лимит 8 с), топ-64, Full первыми, склейка уведомлений.
 - Статистика: при открытии БД удаляются события старше 35 дней (неделя/месяц не меняются); сессии не трогаются.
 - Тексты: сервер ограничивает каждый источник 6 с; клиент кэширует слова один раз и подсвечивает только окрестность текущей позиции через RAF, gated видимостью/воспроизведением.
-- Проверки срезов: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`, `python tests/browser.py` (+ новый `test_external_sources_shape_and_guards`), скриншоты `dist/ui-shots/` (mobile 390×844, desktop 1280×800). Все команды с `-j2` (тулчейн падает на полной параллельности — см. ограничения).
+- Проверки срезов: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (55 passed, 0 failed — 21 набор), `python tests/browser.py` (12 тестов: 9 ok + 3 honest skip без сети; stub SC-цепочка и stub-комната детерминированы), скриншоты `dist/ui-shots/`, CDP `dist/cdp-metrics.json` (heap 2.07→3.39 МБ, long tasks 0, Layout 0.039 с / RecalcStyle 0.020 с суммарно).
 - Windows-база: `disk.rs` cfg для не-unix, `queue.rs` — любая ошибка `try_lock_exclusive` означает занятость (на Windows другой код, чем WouldBlock).
 
 ## Этап 1 — стабилизация (26.11.2026, частично проверено)
