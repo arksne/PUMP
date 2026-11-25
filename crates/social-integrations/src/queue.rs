@@ -69,13 +69,9 @@ impl ScrobbleQueue {
             options.mode(0o600);
         }
         let lock = options.open(PathBuf::from(lock_path))?;
-        lock.try_lock_exclusive().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Error::QueueLocked
-            } else {
-                Error::Io(e)
-            }
-        })?;
+        // Любая ошибка захвата означает занятость очереди: на Linux это
+        // WouldBlock, на Windows — другой код той же коллизии блокировок.
+        lock.try_lock_exclusive().map_err(|_| Error::QueueLocked)?;
         let state = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<State>(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {

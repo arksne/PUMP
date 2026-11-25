@@ -1,8 +1,10 @@
 //! Атомарная запись файлов и проверка путей локального хранилища.
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::fs::File;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
 };
@@ -63,6 +65,8 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<PathBuf> {
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
