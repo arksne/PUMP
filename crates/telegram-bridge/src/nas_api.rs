@@ -173,7 +173,8 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
 }
 /// Тело WebDAV с простоем не дольше 30 с: зависший NAS не держит
 /// соединение и слот семафора вечно. Таймаут рвёт стрим целиком.
-fn nas_body<S>(
+/// Переиспользуется прокси SoundCloud: угроза висящего upstream та же.
+pub(crate) fn nas_body<S>(
     stream: S,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
 where

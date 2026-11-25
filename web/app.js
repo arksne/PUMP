@@ -832,8 +832,9 @@ function tickLyricWords(){
   lyricRaf=0;
   if(audio.paused||document.hidden||!lyricWords.length||!lyricVisible())return;
   const time=audio.currentTime*1000;
+  const effEnd = j => Math.min(lyricWords[j].end, j + 1 < lyricWords.length ? lyricWords[j + 1].start : Infinity);
   let i=lyricWordIndex;
-  if(i<0||i>=lyricWords.length||time<lyricWords[i].start||time>=lyricWords[i].end){
+  if(i<0||i>=lyricWords.length||time<lyricWords[i].start||time>=effEnd(i)){
     let lo=0,hi=lyricWords.length;
     while(lo<hi){const mid=(lo+hi)>>1;if(lyricWords[mid].start<=time)lo=mid+1;else hi=mid;}
     i=lo-1;
@@ -847,9 +848,9 @@ function tickLyricWords(){
     if(i+1<lyricWords.length&&lyricWords[i+1].start<=time+200)changed.push(i+1);
   }
   for(const k of changed){
-    const word=lyricWords[k];
-    word.el.classList.toggle("current",time>=word.start&&time<word.end);
-    word.el.classList.toggle("sung",time>=word.end);
+    const word=lyricWords[k], end=effEnd(k);
+    word.el.classList.toggle("current",time>=word.start&&time<end);
+    word.el.classList.toggle("sung",time>=end);
   }
   syncLyrics();
   lyricRaf=requestAnimationFrame(tickLyricWords);

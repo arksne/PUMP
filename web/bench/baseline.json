@@ -1,0 +1,298 @@
+{
+ "runs": [
+  {
+   "engine": "eq10+preamp",
+   "abi": 1,
+   "config_len": 57,
+   "sample_rate": 48000,
+   "channels": 2,
+   "frames_per_block": 128,
+   "blocks_per_batch": 256,
+   "batches": 15,
+   "warmup_batches": 3,
+   "throttle": "none",
+   "checksum_js": -2899.0361858973724,
+   "checksum_wasm": -2899.0361858973724,
+   "checksum_rel_diff": 0,
+   "checksum_ok": true,
+   "startup_ms": {
+    "compileMs": 0.5,
+    "instantiateMs": 0.10000000149011612
+   },
+   "mem_bytes_before": 1638400,
+   "mem_bytes_after": 1638400,
+   "mem_grew": false,
+   "core": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 110.8805338693249,
+      "p50": 100.7080079489242,
+      "p95": 186.15722660797474,
+      "p99": 186.15722660797474,
+      "min": 97.6562498635758,
+      "max": 186.15722660797474
+     },
+     "xrt_median": 206.86868658845196
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 62.866210919310106,
+      "p50": 54.93164053405053,
+      "p95": 128.1738279885758,
+      "p99": 128.1738279885758,
+      "min": 51.879882676075795,
+      "max": 128.1738279885758
+     },
+     "xrt_median": 379.25925988719297
+    }
+   },
+   "full": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 111.69433590415186,
+      "p50": 103.75976557952526,
+      "p95": 164.79492182952526,
+      "p99": 164.79492182952526,
+      "min": 100.70800772155053,
+      "max": 164.79492182952526
+     },
+     "xrt_median": 200.7843138134878
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 62.86621096478484,
+      "p50": 57.983398392025265,
+      "p95": 137.3291015625,
+      "p99": 137.3291015625,
+      "min": 51.87988290344947,
+      "max": 137.3291015625
+     },
+     "xrt_median": 359.2982458958225
+    }
+   },
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36",
+   "crossOriginIsolated": false
+  },
+  {
+   "engine": "eq10+preamp",
+   "abi": 1,
+   "config_len": 57,
+   "sample_rate": 48000,
+   "channels": 2,
+   "frames_per_block": 128,
+   "blocks_per_batch": 256,
+   "batches": 15,
+   "warmup_batches": 3,
+   "throttle": "none",
+   "checksum_js": -2899.0361858973724,
+   "checksum_wasm": -2899.0361858973724,
+   "checksum_rel_diff": 0,
+   "checksum_ok": true,
+   "startup_ms": {
+    "compileMs": 0.5,
+    "instantiateMs": 0.10000000149011612
+   },
+   "mem_bytes_before": 1638400,
+   "mem_bytes_after": 1638400,
+   "mem_grew": false,
+   "core": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 109.45638023258653,
+      "p50": 100.7080079489242,
+      "p95": 177.0019532614242,
+      "p99": 177.0019532614242,
+      "min": 97.65625009094947,
+      "max": 177.0019532614242
+     },
+     "xrt_median": 206.86868658845196
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 60.42480467840505,
+      "p50": 54.931640761424205,
+      "p95": 128.1738279885758,
+      "p99": 128.1738279885758,
+      "min": 51.879882676075795,
+      "max": 128.1738279885758
+     },
+     "xrt_median": 379.25925831735873
+    }
+   },
+   "full": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 108.23567707423838,
+      "p50": 103.75976557952526,
+      "p95": 158.69140634094947,
+      "p99": 158.69140634094947,
+      "min": 100.70800772155053,
+      "max": 158.69140634094947
+     },
+     "xrt_median": 200.7843138134878
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 62.86621093446835,
+      "p50": 57.983398392025265,
+      "p95": 137.3291015625,
+      "p99": 137.3291015625,
+      "min": 54.93164053405053,
+      "max": 137.3291015625
+     },
+     "xrt_median": 359.2982458958225
+    }
+   },
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36",
+   "crossOriginIsolated": false
+  },
+  {
+   "engine": "eq10+preamp",
+   "abi": 1,
+   "config_len": 57,
+   "sample_rate": 48000,
+   "channels": 2,
+   "frames_per_block": 128,
+   "blocks_per_batch": 256,
+   "batches": 15,
+   "warmup_batches": 3,
+   "throttle": "none",
+   "checksum_js": -2899.0361858973724,
+   "checksum_wasm": -2899.0361858973724,
+   "checksum_rel_diff": 0,
+   "checksum_ok": true,
+   "startup_ms": {
+    "compileMs": 0.3999999985098839,
+    "instantiateMs": 0.10000000149011612
+   },
+   "mem_bytes_before": 1638400,
+   "mem_bytes_after": 1638400,
+   "mem_grew": false,
+   "core": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 115.15299480985657,
+      "p50": 103.75976580689894,
+      "p95": 189.20898446594947,
+      "p99": 189.20898446594947,
+      "min": 100.70800772155053,
+      "max": 189.20898446594947
+     },
+     "xrt_median": 200.78431337349966
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 64.08691404734175,
+      "p50": 54.93164053405053,
+      "p95": 134.27734393189894,
+      "p99": 134.27734393189894,
+      "min": 51.879882676075795,
+      "max": 134.27734393189894
+     },
+     "xrt_median": 379.25925988719297
+    }
+   },
+   "full": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 118.40820311590505,
+      "p50": 106.8115234375,
+      "p95": 216.67480450560106,
+      "p99": 216.67480450560106,
+      "min": 103.75976557952526,
+      "max": 216.67480450560106
+     },
+     "xrt_median": 195.04761904761904
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 62.66276042576161,
+      "p50": 54.931640761424205,
+      "p95": 140.38085942047474,
+      "p99": 140.38085942047474,
+      "min": 51.879882676075795,
+      "max": 140.38085942047474
+     },
+     "xrt_median": 379.25925831735873
+    }
+   },
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36",
+   "crossOriginIsolated": false
+  }
+ ],
+ "throttle_cpu4x": [
+  {
+   "engine": "eq10+preamp",
+   "abi": 1,
+   "config_len": 57,
+   "sample_rate": 48000,
+   "channels": 2,
+   "frames_per_block": 128,
+   "blocks_per_batch": 256,
+   "batches": 15,
+   "warmup_batches": 3,
+   "throttle": "cpu4x",
+   "checksum_js": -2899.0361858973724,
+   "checksum_wasm": -2899.0361858973724,
+   "checksum_rel_diff": 0,
+   "checksum_ok": true,
+   "startup_ms": {
+    "compileMs": 1.2999999970197678,
+    "instantiateMs": 0.5
+   },
+   "mem_bytes_before": 1638400,
+   "mem_bytes_after": 1638400,
+   "mem_grew": false,
+   "core": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 484.8225911094535,
+      "p50": 439.45312495452526,
+      "p95": 903.3203125454747,
+      "p99": 903.3203125454747,
+      "min": 411.9873046875,
+      "max": 903.3203125454747
+     },
+     "xrt_median": 47.407407412313134
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 284.01692713183974,
+      "p50": 256.34765620452526,
+      "p95": 527.9541016989242,
+      "p99": 527.9541016989242,
+      "min": 225.83007830689894,
+      "max": 527.9541016989242
+     },
+     "xrt_median": 81.2698412842581
+    }
+   },
+   "full": {
+    "js": {
+     "ns_per_frame": {
+      "mean": 511.8815103590653,
+      "p50": 466.91894522155053,
+      "p95": 952.1484373635758,
+      "p99": 952.1484373635758,
+      "min": 427.24609375,
+      "max": 952.1484373635758
+     },
+     "xrt_median": 44.61873639213339
+    },
+    "wasm": {
+     "ns_per_frame": {
+      "mean": 349.12109381366463,
+      "p50": 314.33105459655053,
+      "p95": 848.3886720114242,
+      "p99": 848.3886720114242,
+      "min": 241.08886736939894,
+      "max": 848.3886720114242
+     },
+     "xrt_median": 66.27831717128072
+    }
+   },
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36",
+   "crossOriginIsolated": false
+  }
+ ]
+}

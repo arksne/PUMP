@@ -735,7 +735,9 @@ fn video_from_input(term: &str) -> Option<String> {
     valid_video(&id).then_some(id)
 }
 
-fn soundcloud_track(meta: &soundcloud::SourceTrack) -> Track {
+/// Конструктор трека каталога из метаданных SoundCloud (общий для поиска,
+/// комнат и прокси — один и тот же id/audio_url везде).
+pub fn soundcloud_track(meta: &soundcloud::SourceTrack) -> Track {
     Track {
         id: format!("sc-{}", meta.id),
         title: meta.title.clone(),
@@ -916,5 +918,8 @@ mod tests {
         assert!(video_from_input("https://fake.example/?v=5NV6Rdv1a3I").is_none());
         assert!(apple_asset("https://audio-ssl.itunes.apple.com/t.mp3").is_some());
         assert!(apple_asset("https://itunes.apple.com@127.0.0.1/n.mp3").is_none());
+        assert!(apple_asset("https://audio-ssl.itunes.apple.com:8443/t.mp3").is_none());
+        assert!(apple_asset("https://audio-ssl.itunes.apple.com/t.mp3#frag").is_none());
+        assert!(apple_asset("http://audio-ssl.itunes.apple.com/t.mp3").is_none());
     }
 }

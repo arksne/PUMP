@@ -103,10 +103,13 @@ impl LyricsClient {
         Ok(result)
     }
 }
+/// Верхняя граница текста песни: большие ответы усекаются молча,
+/// как и в остальном каталоге (64 КиБ).
+const MAX_LYRICS_BYTES: usize = 64 * 1024;
 fn text(value: &Value, key: &str) -> Option<String> {
     value[key]
         .as_str()
-        .filter(|text| !text.is_empty() && text.len() <= 1024 * 1024)
+        .filter(|text| !text.is_empty() && text.len() <= MAX_LYRICS_BYTES)
         .map(str::to_owned)
 }
 fn component(value: &str) -> String {

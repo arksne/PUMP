@@ -7,6 +7,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
+use core_streaming::Kind;
 pub(crate) use library_storage::sessions::{Period, Store, Summary, valid_token};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -109,6 +110,13 @@ pub(crate) async fn record(
         .track(&event.track_id)
         .await
         .ok_or_else(|| ApiError::missing("Трек не найден."))?;
+    // Встроенное видео не даёт аудиопотока: событие статистики отклоняется,
+    // как и при записи (контракт PLAYER_CONTEXT.md).
+    if track.kind == Kind::Youtube {
+        return Err(ApiError::invalid(
+            "События встроенного видео не учитываются.",
+        ));
+    }
     app.stats
         .record(
             &owner,

@@ -521,8 +521,27 @@ async fn source_sc(
         return ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "Некорректный диапазон.")
             .into_response();
     }
-    if app.catalog.track(&format!("sc-{id}")).await.is_none() {
-        return ApiError::missing("Запись SoundCloud не найдена.").into_response();
+    // Холодный id различаем честно: 404 — нет записи, 409 — запись есть,
+    // но открытого потока нет, 502 — источник временно недоступен.
+    // Маскировка сбоя под «не найдено» ломала бы комнаты и статистику.
+    match app.catalog.soundcloud_client().track(&id).await {
+        Ok(meta) if meta.playback == core_streaming::soundcloud::Playback::Full => {
+            let track = core_streaming::soundcloud_track(&meta);
+            let _ = app.catalog.register_track(track).await;
+        }
+        Ok(_) => {
+            return ApiError::new(
+                StatusCode::CONFLICT,
+                "Для этой записи нет открытого аудиопотока SoundCloud.",
+            )
+            .into_response();
+        }
+        Err(core_streaming::soundcloud::SourceError::NotFound) => {
+            return ApiError::missing("Запись SoundCloud не найдена.").into_response();
+        }
+        Err(_) => {
+            return ApiError::unavailable("SoundCloud недоступен.").into_response();
+        }
     }
     let _permit = match SC_SLOTS.try_acquire() {
         Ok(permit) => permit,
@@ -538,17 +557,19 @@ async fn source_sc(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let mut upstream_request = app
-        .http
-        .request(request.method().clone(), &stream.url)
-        .timeout(std::time::Duration::from_secs(120));
+    let mut upstream_request = app.http.request(request.method().clone(), &stream.url);
     if let Some(range) = request.headers().get(header::RANGE) {
         upstream_request = upstream_request.header(header::RANGE, range);
     }
-    let upstream = match upstream_request.send().await {
-        Ok(upstream) => upstream,
-        Err(_) => return ApiError::unavailable("SoundCloud недоступен.").into_response(),
-    };
+    // Заголовки — за 30 с; тело идёт с idle-таймаутом (см. nas_body),
+    // общий 120-секундный дедлайн здесь вреден: он рвёт длинные треки.
+    let upstream =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), upstream_request.send())
+            .await
+        {
+            Ok(Ok(upstream)) => upstream,
+            _ => return ApiError::unavailable("SoundCloud недоступен.").into_response(),
+        };
     let status = upstream.status();
     if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
         return ApiError::unavailable("SoundCloud недоступен.").into_response();
@@ -576,7 +597,9 @@ async fn source_sc(
             response = response.header(name, value);
         }
     }
-    match response.body(axum::body::Body::from_stream(upstream.bytes_stream())) {
+    match response.body(axum::body::Body::from_stream(nas_api::nas_body(
+        upstream.bytes_stream(),
+    ))) {
         Ok(response) => response.into_response(),
         Err(_) => ApiError::unavailable("Некорректный ответ SoundCloud.").into_response(),
     }

@@ -93,14 +93,21 @@ struct CachedId {
     at: Instant,
 }
 
+/// Причина отрицательного кэша: только стабильные вердикты.
+/// Временные сетевые сбои НЕ кэшируются, иначе один сбой на 5 минут
+/// превратит живой трек в «не найден» для комнат и статистики.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NegReason {
+    Missing,
+    NoStream,
+}
+
 pub struct SoundCloudClient {
     http: reqwest::Client,
     fixed: Option<String>,
     api: String,
     id: Mutex<Option<CachedId>>,
-    /// Отрицательный кэш: не дергать api-v2 по несуществующим id.
-    /// TTL короткий, чтобы ожившие записи подхватывались.
-    neg: Mutex<HashMap<String, Instant>>,
+    neg: Mutex<HashMap<String, (NegReason, Instant)>>,
 }
 
 const NEG_TTL: Duration = Duration::from_secs(5 * 60);
@@ -219,23 +226,27 @@ impl SoundCloudClient {
         parse_search(&data)
     }
 
-    async fn remember_negative(&self, id: &str) {
+    async fn remember_negative(&self, id: &str, reason: NegReason) {
         let mut neg = self.neg.lock().await;
-        neg.retain(|_, at| at.elapsed() < NEG_TTL);
+        neg.retain(|_, (_, at)| at.elapsed() < NEG_TTL);
         if neg.len() >= NEG_CAP
-            && let Some(oldest) = neg.iter().min_by_key(|(_, at)| *at).map(|(k, _)| k.clone())
+            && let Some(oldest) = neg
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
         {
             neg.remove(&oldest);
         }
-        neg.insert(id.into(), Instant::now());
+        neg.insert(id.into(), (reason, Instant::now()));
     }
 
-    async fn is_negative(&self, id: &str) -> bool {
+    async fn negative(&self, id: &str) -> Option<NegReason> {
         self.neg
             .lock()
             .await
             .get(id)
-            .is_some_and(|at| at.elapsed() < NEG_TTL)
+            .filter(|(_, at)| at.elapsed() < NEG_TTL)
+            .map(|(reason, _)| *reason)
     }
 
     /// Разрешение трека в прямой поток. Принимает числовой ID.
@@ -243,17 +254,28 @@ impl SoundCloudClient {
         if !valid_id(id) {
             return Err(SourceError::Invalid);
         }
-        if self.is_negative(id).await {
-            return Err(SourceError::NotFound);
+        match self.negative(id).await {
+            Some(NegReason::Missing) => return Err(SourceError::NotFound),
+            Some(NegReason::NoStream) => return Err(SourceError::NoStream),
+            None => {}
         }
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
-        let data = self
+        let data = match self
             .get_json(&format!("{}/tracks/{track_id}", self.api))
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(SourceError::NotFound) => {
+                self.remember_negative(id, NegReason::Missing).await;
+                return Err(SourceError::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
         match self.stream_from_track(&data).await {
             Ok(stream) => Ok(stream),
+            Err(SourceError::Unavailable) => Err(SourceError::Unavailable),
             Err(error) => {
-                self.remember_negative(id).await;
+                self.remember_negative(id, NegReason::NoStream).await;
                 Err(error)
             }
         }
@@ -282,7 +304,7 @@ impl SoundCloudClient {
         if !valid_id(id) {
             return Err(SourceError::Invalid);
         }
-        if self.is_negative(id).await {
+        if self.negative(id).await.is_some() {
             return Err(SourceError::NotFound);
         }
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
@@ -293,7 +315,7 @@ impl SoundCloudClient {
         match parse_track(&data) {
             Some(track) if track.playback != Playback::Blocked => Ok(track),
             _ => {
-                self.remember_negative(id).await;
+                self.remember_negative(id, NegReason::Missing).await;
                 Err(SourceError::NotFound)
             }
         }
@@ -647,6 +669,10 @@ mod tests {
         ));
         assert!(valid_stream_url("http://127.0.0.1:8080/cdn/x.mp3"));
         assert!(!valid_stream_url("http://127.0.0.1:8080.evil.test/x.mp3"));
+        assert!(!valid_stream_url("https://127.0.0.1/x.mp3"));
+        assert!(valid_id("424242"));
+        assert!(!valid_id(""));
+        assert!(!valid_id("12a34"));
         assert_eq!(track_id_from_link("123456789"), Some("123456789".into()));
         assert_eq!(
             track_id_from_link("1234567890123456789").as_deref(),
@@ -711,5 +737,7 @@ mod tests {
         assert!(valid_stream_url("http://127.0.0.1:8080/cdn/x.mp3"));
         assert!(!valid_stream_url("http://evil.test/x.mp3"));
         assert!(!valid_stream_url("https://127.0.0.1/x.mp3"));
+        assert!(valid_media_url("https://i1.sndcdn.com/art.jpg"));
+        assert!(!valid_media_url("http://i1.sndcdn.com/art.jpg"));
     }
 }

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="UTF-8"><title>PUMP DSP bench</title></head>
+<body>
+<pre id="out">run...</pre>
+<script type="module">
+import { runBench } from "./harness.js";
+import { benchConfig, SAMPLE_RATE } from "./fixtures.js";
+
+const out = document.getElementById("out");
+try {
+  const params = new URLSearchParams(location.search);
+  const throttle = params.get("throttle") || "none";
+  const result = await runBench({
+    wasmUrl: new URL("../pkg/pump_dsp.wasm", location.href).href,
+    sampleRate: SAMPLE_RATE,
+    config: benchConfig(),
+    throttleNote: throttle,
+  });
+  result.userAgent = navigator.userAgent;
+  result.crossOriginIsolated = window.crossOriginIsolated;
+  out.textContent = JSON.stringify(result);
+  window.__benchResult = result;
+} catch (error) {
+  out.textContent = JSON.stringify({error: String(error && error.message || error)});
+  window.__benchResult = {error: String(error && error.message || error)};
+} finally {
+  window.__benchDone = true;
+}
+</script>
+</body>
+</html>
