@@ -653,10 +653,10 @@ class PlayerTest(unittest.TestCase):
             # Перемотка ставит активную строку по времени.
             page.locator("#audio").evaluate("(audio) => { audio.currentTime = 4.2; }")
             expect(page.locator(".l-line.active")).to_have_text("Two", timeout=8000)
-            # Медленная скорость видна: за 1.5 с строка не успевает смениться
-            # (на 1.0x "Four" появилась бы через 0.8 c).
-            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 6.4; audio.playbackRate = 0.5; }")
-            page.wait_for_timeout(1500)
+            # Медленная скорость видна: за 1.7 с строка не успевает смениться
+            # (на 1.0x "Four" появилась бы через 1.0 c, на 0.5x нужно 2.0 c).
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 6.0; audio.playbackRate = 0.5; }")
+            page.wait_for_timeout(1700)
             self.assertEqual(page.locator(".l-line.active").inner_text(), "Three")
             expect(page.locator(".l-line.active")).to_have_text("Four", timeout=8000)
             # Пауза в середине строки фиксирует её; продолжение — без скачка.
