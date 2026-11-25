@@ -62,6 +62,7 @@ export async function runBench({ wasmUrl, sampleRate, config, throttleNote }) {
   views.config.set(config);
   if (w.pump_dsp_configure() !== 0) throw new Error("configure failed");
   const js = makeJsDsp(sampleRate, config);
+  const jsIn = new Float32Array(BLOCK_FRAMES * 2);
   const jsOut = new Float32Array(BLOCK_FRAMES * 2);
 
   // Разогрев: истории фильтров должны устаканиться до замера.
@@ -81,7 +82,9 @@ export async function runBench({ wasmUrl, sampleRate, config, throttleNote }) {
     let t0 = performance.now();
     for (let k = 0; k < BLOCKS_PER_BATCH; k++) {
       const off = (k * BLOCK_FRAMES * 2) % input.length;
-      js.processInto(input.subarray(off, off + BLOCK_FRAMES * 2), jsOut, BLOCK_FRAMES);
+      // Честное зеркало WASM-пути: копируем блок во входной буфер, а не читаем subarray напрямую.
+      jsIn.set(input.subarray(off, off + BLOCK_FRAMES * 2));
+      js.processInto(jsIn, jsOut, BLOCK_FRAMES);
       for (let i = 0; i < BLOCK_FRAMES * 2; i++) {
         checksumJs += jsOut[i];
         sumSqJs += jsOut[i] * jsOut[i];

@@ -192,10 +192,12 @@ mod tests {
             .record("guest:x", "new-event", "t", "T", "A", 2000)
             .await
             .unwrap();
+        store.0.close().await;
         drop(store);
         let store = Store::open(&path).await.unwrap();
         let summary = store.read("guest:x", Period::Month).await.unwrap();
         assert_eq!(summary.milliseconds, 2000);
         assert_eq!(summary.tracks, 1);
+        store.0.close().await;
     }
 }

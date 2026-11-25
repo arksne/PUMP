@@ -107,6 +107,7 @@ pub(crate) async fn download(
             // Произвольный URL провайдера сюда не проходит.
             url.origin() == app.library.base.origin()
                 || (url.scheme() == "https"
+                    && url.port().is_none()
                     && url.host_str().is_some_and(|h| {
                         h.ends_with(".sndcdn.com")
                             || h.ends_with(".mzstatic.com")

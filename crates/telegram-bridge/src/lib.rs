@@ -365,7 +365,8 @@ async fn search(
             result.tracks.append(&mut remote.tracks);
             notices.extend(remote.notice);
         }
-        _ => notices.push("SoundCloud не ответил вовремя. Его можно выбрать отдельно.".into()),
+        Ok(Err(_)) => notices.push("SoundCloud недоступен. Его можно выбрать отдельно.".into()),
+        Err(_) => notices.push("SoundCloud не ответил вовремя. Его можно выбрать отдельно.".into()),
     }
     if app.spotify_app.is_some() {
         let found = tokio::time::timeout(
@@ -389,6 +390,7 @@ async fn search(
         .sort_by_key(|track| track.kind != catalog::Kind::Full);
     result.tracks.truncate(64);
     if !notices.is_empty() {
+        notices.sort_unstable();
         notices.dedup();
         result.notice = Some(notices.join(" "));
     }
@@ -521,6 +523,18 @@ async fn source_sc(
         return ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "Некорректный диапазон.")
             .into_response();
     }
+    // Семафор берём ДО метаданных: перебор случайных id без него
+    // устроит неограниченный поток запросов к api-v2.
+    let permit = match SC_SLOTS.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Слишком много потоков. Повтори через несколько секунд.",
+            )
+            .into_response();
+        }
+    };
     // Холодный id различаем честно: 404 — нет записи, 409 — запись есть,
     // но открытого потока нет, 502 — источник временно недоступен.
     // Маскировка сбоя под «не найдено» ломала бы комнаты и статистику.
@@ -539,18 +553,15 @@ async fn source_sc(
         Err(core_streaming::soundcloud::SourceError::NotFound) => {
             return ApiError::missing("Запись SoundCloud не найдена.").into_response();
         }
-        Err(_) => {
-            return ApiError::unavailable("SoundCloud недоступен.").into_response();
-        }
-    }
-    let _permit = match SC_SLOTS.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
+        Err(core_streaming::soundcloud::SourceError::NoStream) => {
             return ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Слишком много потоков. Повтори через несколько секунд.",
+                StatusCode::CONFLICT,
+                "Для этой записи нет открытого аудиопотока SoundCloud.",
             )
             .into_response();
+        }
+        Err(_) => {
+            return ApiError::unavailable("SoundCloud недоступен.").into_response();
         }
     };
     let stream = match app.catalog.soundcloud_client().resolve(&id).await {
@@ -580,7 +591,7 @@ async fn source_sc(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    if !mime.starts_with("audio/") {
+    if status != StatusCode::RANGE_NOT_SATISFIABLE && !mime.starts_with("audio/") {
         return ApiError::unavailable("Источник вернул не аудио.").into_response();
     }
     let mut response = Response::builder()
@@ -597,8 +608,40 @@ async fn source_sc(
             response = response.header(name, value);
         }
     }
-    match response.body(axum::body::Body::from_stream(nas_api::nas_body(
-        upstream.bytes_stream(),
+    match response.body(axum::body::Body::from_stream(futures_util::stream::unfold(
+        (upstream.bytes_stream(), Some(permit)),
+        |(mut inner, permit)| async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                futures_util::StreamExt::next(&mut inner),
+            )
+            .await
+            {
+                Err(_) => {
+                    drop(permit);
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "простой потока NAS",
+                        )),
+                        (inner, None),
+                    ))
+                }
+                Ok(None) => {
+                    drop(permit);
+                    None
+                }
+                Ok(Some(item)) => {
+                    let item = item.map_err(std::io::Error::other);
+                    if item.is_err() {
+                        drop(permit);
+                        Some((item, (inner, None)))
+                    } else {
+                        Some((item, (inner, permit)))
+                    }
+                }
+            }
+        },
     ))) {
         Ok(response) => response.into_response(),
         Err(_) => ApiError::unavailable("Некорректный ответ SoundCloud.").into_response(),

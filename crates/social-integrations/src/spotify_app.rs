@@ -73,11 +73,12 @@ impl SpotifyAppClient {
         Ok(value)
     }
 
-    async fn search_once(&self, query: &str, limit: u8) -> Result<reqwest::Response> {
+    async fn search_once(&self, query: &str, limit: u8) -> Result<(reqwest::Response, String)> {
         let token = self.bearer().await?;
-        self.http
+        let response = self
+            .http
             .get("https://api.spotify.com/v1/search")
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .query(&[
                 ("q", query),
                 ("type", "track"),
@@ -85,7 +86,8 @@ impl SpotifyAppClient {
             ])
             .send()
             .await
-            .map_err(|_| Error::Protocol("Поиск Spotify недоступен".into()))
+            .map_err(|_| Error::Protocol("Поиск Spotify недоступен".into()))?;
+        Ok((response, token))
     }
 
     /// Метаданные треков для сопоставления с каталогом. Звука здесь нет.
@@ -94,11 +96,16 @@ impl SpotifyAppClient {
         if query.is_empty() || query.chars().count() > 140 {
             return Err(Error::Invalid("Поисковый запрос слишком длинный".into()));
         }
-        let response = self.search_once(query, limit).await?;
+        let (response, used) = self.search_once(query, limit).await?;
         let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Токен могли отозвать раньше expires_in: сбросить и повторить один раз.
-            *self.token.lock().await = None;
-            self.search_once(query, limit).await?
+            // Обнуляем только свою эпоху, чтобы не выкинуть свежий токен соседней задачи.
+            let mut slot = self.token.lock().await;
+            if slot.as_ref().is_some_and(|t| t.value == used) {
+                *slot = None;
+            }
+            drop(slot);
+            self.search_once(query, limit).await?.0
         } else {
             response
         };

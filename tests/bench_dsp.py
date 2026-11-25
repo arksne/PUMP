@@ -72,6 +72,11 @@ def main():
     httpd.shutdown()
     httpd.server_close()
     out = ROOT / "web" / "bench" / "baseline.json"
+    prev = None
+    try:
+        prev = json.loads(out.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prev = None
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for key in ("runs", "throttle_cpu4x"):
         for run in report[key]:
@@ -80,6 +85,16 @@ def main():
                   round(core["wasm"]["ns_per_frame"]["p50"] / max(core["js"]["ns_per_frame"]["p50"], 1e-9), 3),
                   "xRT wasm:", round(core["wasm"]["xrt_median"], 1),
                   "checksum_rel:", run["checksum_rel_diff"])
+    if isinstance(prev, dict):
+        def med(runs, eng="wasm"):
+            vals = [r["core"][eng]["ns_per_frame"]["p50"] for r in runs if "core" in r]
+            vals.sort()
+            return vals[len(vals) // 2] if vals else None
+        for key in ("runs", "throttle_cpu4x"):
+            old = med(prev.get(key, []))
+            new = med(report.get(key, []))
+            if old and new and new > 2 * old:
+                print(f"WARNING regression {key}: p50 {old:.1f} -> {new:.1f} ns/frame (>2x baseline)")
     print("saved", out)
     return 0
 

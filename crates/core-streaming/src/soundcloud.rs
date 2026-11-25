@@ -304,8 +304,10 @@ impl SoundCloudClient {
         if !valid_id(id) {
             return Err(SourceError::Invalid);
         }
-        if self.negative(id).await.is_some() {
-            return Err(SourceError::NotFound);
+        match self.negative(id).await {
+            Some(NegReason::Missing) => return Err(SourceError::NotFound),
+            Some(NegReason::NoStream) => return Err(SourceError::NoStream),
+            None => {}
         }
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
         let data = self
@@ -342,13 +344,17 @@ impl SoundCloudClient {
         // Ответ resolve короткий; большой ответ отклоняется до парсинга.
         let mut bytes = Vec::new();
         let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|_| SourceError::NoStream)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| SourceError::Unavailable)?
+        {
             if bytes.len() + chunk.len() > 65536 {
-                return Err(SourceError::NoStream);
+                return Err(SourceError::Unavailable);
             }
             bytes.extend_from_slice(&chunk);
         }
-        let data: Value = serde_json::from_slice(&bytes).map_err(|_| SourceError::NoStream)?;
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| SourceError::Unavailable)?;
         let url = data["url"].as_str().ok_or(SourceError::NoStream)?;
         if !valid_stream_url(url) {
             return Err(SourceError::NoStream);
@@ -467,12 +473,20 @@ fn extract_client_id(code: &[u8]) -> Option<String> {
     let mut rest = code;
     while let Some(i) = rest.find("client_id") {
         let after = &rest[i + "client_id".len()..];
-        let value = after
-            .trim_start_matches([' ', '\t', '=', ':'])
-            .trim_start_matches([' ', '\t', '"', '\'']);
+        // Строгий контекст: `client_id` + пробелы + `:`/`=` + пробелы/кавычки.
+        let sep = after.trim_start_matches([' ', '\t']);
+        let Some(sep) = sep.strip_prefix([':', '=']) else {
+            rest = &after[1.min(after.len())..];
+            continue;
+        };
+        let value = sep.trim_start_matches([' ', '\t', '"', '\'']);
         if value.len() >= 32 {
             let id: String = value.chars().take(32).collect();
-            if id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            let terminator_ok = value
+                .chars()
+                .nth(32)
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if id.bytes().all(|b| b.is_ascii_alphanumeric()) && terminator_ok {
                 return Some(id);
             }
         }
@@ -572,7 +586,8 @@ fn check_api_url(url: &str, base: &str) -> bool {
 }
 
 /// Подписанные CDN-ссылки живут только на хостах SoundCloud
-/// (http разрешён лишь на loopback — для локальных стендов).
+/// (http разрешён лишь на loopback для локальных стендов со своим
+/// SOUNDCLOUD_API_BASE и в юнит-тестах; в проде без переопределения — нет).
 pub fn valid_stream_url(url: &str) -> bool {
     url::Url::parse(url).ok().is_some_and(|u| {
         u.username().is_empty()
@@ -581,8 +596,18 @@ pub fn valid_stream_url(url: &str) -> bool {
                 && u.port().is_none()
                 && u.host_str()
                     .is_some_and(|h| h == "sndcdn.com" || h.ends_with(".sndcdn.com")))
-                || (u.scheme() == "http" && is_loopback(&u)))
+                || (u.scheme() == "http" && is_loopback(&u) && http_loopback_allowed()))
     })
+}
+
+fn http_loopback_allowed() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    !std::env::var("SOUNDCLOUD_API_BASE")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
 }
 
 fn valid_media_url(url: &str) -> bool {

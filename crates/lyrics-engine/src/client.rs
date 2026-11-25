@@ -35,22 +35,22 @@ impl LyricsClient {
             });
         }
         // Оба источника ограничены суммарно: медленный ответ не держит запрос.
+        // Тело читаем с лимитом до парсинга, чтобы большой ответ не раздувал память.
         let timed = async {
             tokio::time::timeout(SOURCE_TIMEOUT, async {
-                let r = self
+                let resp = self
                     .http
                     .get("https://lrclib.net/api/get")
                     .query(&[("artist_name", artist), ("track_name", title)])
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Value>()
-                    .await?;
-                Ok::<Value, reqwest::Error>(r)
+                    .await
+                    .ok()?
+                    .error_for_status()
+                    .ok()?;
+                bounded_json(resp).await
             })
             .await
             .ok()?
-            .ok()
         };
         let plain = async {
             let url = format!(
@@ -59,19 +59,18 @@ impl LyricsClient {
                 component(title)
             );
             tokio::time::timeout(SOURCE_TIMEOUT, async {
-                let r = self
+                let resp = self
                     .http
                     .get(url)
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Value>()
-                    .await?;
-                Ok::<Value, reqwest::Error>(r)
+                    .await
+                    .ok()?
+                    .error_for_status()
+                    .ok()?;
+                bounded_json(resp).await
             })
             .await
             .ok()?
-            .ok()
         };
         let (timed, plain) = tokio::join!(timed, plain);
         let mut result = LyricsResult {
@@ -106,6 +105,25 @@ impl LyricsClient {
 /// Верхняя граница текста песни: большие ответы усекаются молча,
 /// как и в остальном каталоге (64 КиБ).
 const MAX_LYRICS_BYTES: usize = 64 * 1024;
+/// Лимит тела ответа до парсинга: JSON-обёртка чуть больше полей.
+const MAX_BODY_BYTES: usize = 128 * 1024;
+async fn bounded_json(response: reqwest::Response) -> Option<Value> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > MAX_BODY_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
 fn text(value: &Value, key: &str) -> Option<String> {
     value[key]
         .as_str()

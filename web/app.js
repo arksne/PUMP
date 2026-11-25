@@ -376,8 +376,11 @@ async function loadLyrics(track) {
   }
 }
 function syncLyrics(force=false) {
-  let next = -1;
-  while (next+1 < lyricLines.length && lyricLines[next+1].time <= audio.currentTime) next++;
+  const t = audio.currentTime;
+  let next = lyricIndex;
+  if (next >= lyricLines.length) next = lyricLines.length - 1;
+  while (next >= 0 && lyricLines[next].time > t) next--;
+  while (next+1 < lyricLines.length && lyricLines[next+1].time <= t) next++;
   if (next === lyricIndex && !force) return;
   const children = node("lyricsBox").children;
   children.item(lyricIndex)?.classList.remove("active");
