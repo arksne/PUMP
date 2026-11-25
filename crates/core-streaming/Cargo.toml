@@ -8,12 +8,12 @@ anyhow = "1"
 axum = "0.8"
 hex = "0.4"
 lofty = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sha1 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "sync", "rt"] }
+tokio = { version = "1", features = ["fs", "net", "sync", "rt"] }
 tracing = "0.1"
 url = "2"

@@ -114,12 +114,7 @@ pub async fn run() -> Result<()> {
         }
         None => None,
     };
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(4))
-        .timeout(std::time::Duration::from_secs(9))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("PUMP/0.1 music player")
-        .build()?;
+    let http = catalog::network::client_builder()?.build()?;
     let media = setting("PUMP_MEDIA_DIR").map(PathBuf::from);
     let catalog = Arc::new(
         Catalog::load(media, http.clone(), setting("YOUTUBE_API_KEY"))
