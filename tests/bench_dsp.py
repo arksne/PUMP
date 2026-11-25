@@ -71,6 +71,15 @@ def main():
             browser.close()
     httpd.shutdown()
     httpd.server_close()
+    # Размер WASM: raw + gzip -9 (измерено, не выдумано).
+    import gzip as _gzip
+    wasm = ROOT / "web" / "pkg" / "pump_dsp.wasm"
+    raw = wasm.read_bytes()
+    report["wasm_bytes"] = {
+        "raw": len(raw),
+        "gzip9": len(_gzip.compress(raw, 9)),
+        "file": "web/pkg/pump_dsp.wasm",
+    }
     out = ROOT / "web" / "bench" / "baseline.json"
     prev = None
     try:

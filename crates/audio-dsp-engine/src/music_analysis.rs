@@ -16,7 +16,7 @@
 //! Память ограничена: вход берётся срезом (без копирования PCM целиком —
 //! моно-микс идёт в один `Vec<f32>`), FFT-план и рабочие буферы переиспользуются
 //! внутри [`MusicAnalyzer`], хранятся только chroma/энергия на STFT-кадр
-//! (13 f32), а не спектры. Лимит входа — [`MAX_ANALYSIS_FRAMES`].
+//! (13 f32), а не спектры. Лимит входа — 300 с + [`MAX_ANALYSIS_FRAMES_ABS`].
 
 use crate::{Error, Result, StereoFrame, sample_rate, validate_frames};
 use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
@@ -24,17 +24,32 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Версия результата: кэш анализа инвалидируется при несовпадении.
+/// Чек-лист: меняешь алгоритм/пороги/константы ниже — бампаешь версию.
 pub const ANALYSIS_VERSION: u32 = 1;
-/// Лимит входа (~300 с стерео 48 кГц). Длиннее — ошибка, а не OOM.
-pub const MAX_ANALYSIS_FRAMES: usize = 14_400_000;
+/// Лимит входа: 300 с на текущей частоте + абсолютный потолок кадров.
+/// Кадровый лимит старого вида отвергал 3 мин на 96 кГц; теперь высоких
+/// частот хватает на 300 с тоже, потолок держит память (моно-микс 4 Б/кадр).
+pub const MAX_ANALYSIS_SECONDS: u64 = 300;
+pub const MAX_ANALYSIS_FRAMES_ABS: usize = 28_800_000;
 
-const FFT_LEN: usize = 4096;
-const HOP: usize = 1024;
 const MIN_BPM: f64 = 50.0;
 const MAX_BPM: f64 = 220.0;
 const CANCEL_MASK: usize = 31;
 const SILENCE_DBFS: f64 = -60.0;
 const SILENCE_MIN_SECONDS: f64 = 0.2;
+
+/// Длина STFT-окна по частоте дискретизации: держим разрешение ~10.7 Гц
+/// (иначе на 96 кГц бин 23 Гц сливает соседние pitch-классы низким нотам).
+/// Шаг — всегда окно/4: временное разрешение огибающей постоянно (~21 мс).
+fn fft_len_for(rate: u32) -> usize {
+    if rate <= 48_000 {
+        4096
+    } else if rate <= 96_000 {
+        8192
+    } else {
+        16384
+    }
+}
 
 /// Профили Krumhansl–Schmuckler (12 pitch-классов от C). Эмпирические константы
 /// из литературы (Krumhansl-Kessler), используются для корреляции, а не код.
@@ -44,6 +59,16 @@ const KS_MAJOR: [f64; 12] = [
 const KS_MINOR: [f64; 12] = [
     6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
 ];
+
+/// Лимит входа по длительности (300 с) + абсолютный потолок кадров.
+/// Проверяется ДО validate_frames, чтобы гигантский вход отвергался без скана.
+pub(crate) fn check_len(frames_len: usize, rate: u32) -> Result<()> {
+    let by_time = (MAX_ANALYSIS_SECONDS as usize).saturating_mul(rate as usize);
+    if frames_len > by_time.min(MAX_ANALYSIS_FRAMES_ABS) {
+        return Err(Error::Invalid("analysis input too long"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PitchClass {
@@ -179,39 +204,64 @@ pub struct MusicAnalysis {
 }
 
 /// Переиспользуемое ядро: FFT-план и рабочие буферы живут между вызовами.
+/// STFT-цикл не аллоцирует: mag/log/prev/scratch переиспользуются,
+/// `process_with_scratch` вместо аллоцирующего `process` (см. realfft).
+/// Длина окна зависит от частоты дискретизации (см. `fft_len_for`),
+/// шаг — всегда окно/4.
 pub struct MusicAnalyzer {
     rate: u32,
+    fft_len: usize,
+    hop: usize,
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
     input: Vec<f32>,
     spectrum: Vec<Complex<f32>>,
+    mag: Vec<f32>,
+    log: Vec<f32>,
+    prev: Vec<f32>,
+    have_prev: bool,
+    scratch: Vec<Complex<f32>>,
 }
 
 impl MusicAnalyzer {
     pub fn new(rate: u32) -> Result<Self> {
         sample_rate(rate)?;
+        let fft_len = fft_len_for(rate);
+        let hop = fft_len / 4;
         let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_LEN);
-        let window: Vec<f32> = (0..FFT_LEN)
+        let fft = planner.plan_fft_forward(fft_len);
+        let window: Vec<f32> = (0..fft_len)
             .map(|i| {
-                (0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / FFT_LEN as f64).cos()))
+                (0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / fft_len as f64).cos()))
                     as f32
             })
             .collect();
         let input = fft.make_input_vec();
         let spectrum = fft.make_output_vec();
+        let scratch = fft.make_scratch_vec();
+        let mag = vec![0.0f32; fft_len / 2 + 1];
+        let log = vec![0.0f32; fft_len / 2 + 1];
+        let prev = vec![0.0f32; fft_len / 2 + 1];
         Ok(Self {
             rate,
+            fft_len,
+            hop,
             fft,
             window,
             input,
             spectrum,
+            mag,
+            log,
+            prev,
+            have_prev: false,
+            scratch,
         })
     }
 
     pub fn reset(&mut self) {
         self.input.fill(0.0);
         self.spectrum.fill(Complex::new(0.0, 0.0));
+        self.have_prev = false;
     }
 
     pub fn analyze(
@@ -220,32 +270,52 @@ impl MusicAnalyzer {
         cancel: &AtomicBool,
     ) -> Result<MusicAnalysis> {
         sample_rate(self.rate)?;
+        // Лимит — до скана входа, чтобы гигантский вход отвергался дёшево.
+        check_len(frames.len(), self.rate)?;
         validate_frames(frames)?;
-        if frames.len() > MAX_ANALYSIS_FRAMES {
-            return Err(Error::Invalid("analysis input too long"));
-        }
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
         let duration_seconds = frames.len() as f64 / self.rate as f64;
 
-        // Пики: sample peak точно, true peak 4x линейной оценкой.
+        // Пики: sample peak точно; true peak — параболической интерполяцией
+        // вершин (ловит интер-сэмпловые превышения; верхняя оценка, не полифазник).
         let mut sample_peak = 0.0f64;
         let mut true_peak = 0.0f64;
-        let mut prev = [0.0f32; 2];
         for (i, f) in frames.iter().enumerate() {
-            for ch in 0..2 {
-                let s = f[ch] as f64;
-                sample_peak = sample_peak.max(s.abs());
-                if i > 0 {
-                    for k in 1..4 {
-                        let t = k as f64 / 4.0;
-                        let v = (prev[ch] as f64) * (1.0 - t) + s * t;
-                        true_peak = true_peak.max(v.abs());
+            if i & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            for sample in f.iter() {
+                sample_peak = sample_peak.max(sample.abs() as f64);
+            }
+            // Парабола по тройке (prev, cur, next): вершина видна, когда
+            // текущий сэмпл — локальный экстремум.
+            if i > 0 && i + 1 < frames.len() {
+                for ch in 0..2 {
+                    let (y0, y1, y2) = (
+                        frames[i - 1][ch] as f64,
+                        f[ch] as f64,
+                        frames[i + 1][ch] as f64,
+                    );
+                    let is_peak =
+                        (y1 > 0.0 && y1 >= y0 && y1 >= y2) || (y1 < 0.0 && y1 <= y0 && y1 <= y2);
+                    if is_peak {
+                        let denom = y0 - 2.0 * y1 + y2;
+                        let yv = if denom.abs() > 1e-12 {
+                            let off = 0.5 * (y0 - y2) / denom;
+                            if off.abs() <= 1.0 {
+                                y1 - 0.25 * (y0 - y2) * off
+                            } else {
+                                y1
+                            }
+                        } else {
+                            y1
+                        };
+                        true_peak = true_peak.max(yv.abs());
                     }
                 }
             }
-            prev = *f;
         }
         true_peak = true_peak.max(sample_peak);
 
@@ -255,52 +325,52 @@ impl MusicAnalyzer {
             .map(|f| (f[0] as f64 * 0.5 + f[1] as f64 * 0.5) as f32)
             .collect();
 
-        let empty = MusicAnalysis {
-            version: ANALYSIS_VERSION,
-            sample_rate: self.rate,
-            frames: frames.len(),
-            duration_seconds,
-            bpm: None,
-            beats: Vec::new(),
-            beat_confidence: 0.0,
-            key: None,
-            rms: crate::analysis::rms(frames).unwrap_or([0.0; 2]),
-            sample_peak,
-            true_peak,
-            integrated_lufs: None,
-            energy_curve_db: Vec::new(),
-            silence: Vec::new(),
-            sections: Vec::new(),
-            transitions: Vec::new(),
-        };
-        if mono.len() < FFT_LEN + HOP * 3 {
+        // RMS один раз: после validate_frames ошибка недостижима, `?` вместо
+        // маскирующего unwrap_or фиксирует инвариант.
+        let rms = crate::analysis::rms(frames)?;
+        let short_min = self.fft_len + self.hop * 3;
+        if mono.len() < short_min {
             // Слишком коротко для STFT: громкость/тишину всё равно считаем.
-            let mut full = empty;
-            let mut loud = crate::analysis::LoudnessMeter::new(self.rate)?;
-            loud.process(frames)?;
-            full.integrated_lufs = loud.reading().integrated_lufs;
-            full.energy_curve_db = energy_curve(&mono, self.rate);
-            full.silence = silence_segments(&mono, self.rate);
-            return Ok(full);
+            let (energy_curve_db, _) = energy_curve(frames, self.rate);
+            return Ok(MusicAnalysis {
+                version: ANALYSIS_VERSION,
+                sample_rate: self.rate,
+                frames: frames.len(),
+                duration_seconds,
+                bpm: None,
+                beats: Vec::new(),
+                beat_confidence: 0.0,
+                key: None,
+                rms,
+                sample_peak,
+                true_peak,
+                integrated_lufs: self.meter_lufs(frames, cancel)?,
+                energy_curve_db,
+                silence: silence_segments(frames, self.rate),
+                sections: Vec::new(),
+                transitions: Vec::new(),
+            });
         }
 
-        // STFT: flux (full + kick-band) и chroma на кадр.
-        let bin_hz = self.rate as f64 / FFT_LEN as f64;
+        // STFT: flux (kick-band) и chroma на кадр. Горячий цикл без аллокаций:
+        // mag/log/prev/scratch — поля ядра, обмен prev/log через swap.
+        let bin_hz = self.rate as f64 / self.fft_len as f64;
+        let (fft_len, hop) = (self.fft_len, self.hop);
         // Кик-полоса: фундаментал бочки 50–100 Гц; при 280 Гц туда пролезает
         // энергия хэта/шума и IOI строится по subdivision. 160 Гц отделяет кик.
-        let low_bins = ((160.0 / bin_hz).floor() as usize).clamp(2, FFT_LEN / 2);
-        let mut prev_mag: Option<Vec<f32>> = None;
+        let low_bins = ((160.0 / bin_hz).floor() as usize).clamp(2, fft_len / 2);
         let mut novelty_low: Vec<f32> = Vec::new();
         // ВЧ-флюкс (>2 кГц) отличает перкуссию от тонального гула: у сустейна
         // там только численный шум, у любого транзиента — значимая энергия.
-        let hf_start = ((2000.0 / bin_hz).ceil() as usize).min(FFT_LEN / 2);
+        let hf_start = ((2000.0 / bin_hz).ceil() as usize).min(fft_len / 2);
         let mut hf_max = 0.0f32;
         let mut full_max = 0.0f32;
         let mut chromas: Vec<[f32; 12]> = Vec::new();
         let mut frame_energy: Vec<f32> = Vec::new();
+        self.have_prev = false;
         let mut stft_index = 0usize;
         let mut pos = 0usize;
-        while pos + FFT_LEN <= mono.len() {
+        while pos + fft_len <= mono.len() {
             if stft_index & CANCEL_MASK == 0 && cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
@@ -308,23 +378,24 @@ impl MusicAnalyzer {
                 *slot = mono[pos + i] * self.window[i];
             }
             self.fft
-                .process(&mut self.input, &mut self.spectrum)
+                .process_with_scratch(&mut self.input, &mut self.spectrum, &mut self.scratch)
                 .map_err(|_| Error::Invalid("fft failed"))?;
-            let half = FFT_LEN / 2;
-            let mut mag = vec![0.0f32; half + 1];
+            let half = fft_len / 2;
             for (i, c) in self.spectrum.iter().enumerate().take(half + 1) {
-                mag[i] = (c.re * c.re + c.im * c.im).sqrt();
+                self.mag[i] = (c.re * c.re + c.im * c.im).sqrt();
             }
             // Логарифмический flux с ФИКСИРОВАННОЙ компрессией (aubio-стиль):
             // нормировка на пик кадра делала бы тихий хэт равным кику и
             // раздувала бы биения утечки сустейна — уровни должны различаться.
-            let logmag: Vec<f32> = mag.iter().map(|&m| (1.0 + 10.0 * m).ln()).collect();
-            if let Some(prev) = prev_mag.take() {
+            for (m, l) in self.mag.iter().zip(self.log.iter_mut()) {
+                *l = (1.0 + 10.0 * m).ln();
+            }
+            if self.have_prev {
                 let mut ff = 0.0f32;
                 let mut lf = 0.0f32;
                 let mut hf = 0.0f32;
-                for i in 1..logmag.len() {
-                    let d = (logmag[i] - prev[i]).max(0.0);
+                for i in 1..self.log.len() {
+                    let d = (self.log[i] - self.prev[i]).max(0.0);
                     ff += d;
                     if i <= low_bins {
                         lf += d;
@@ -337,17 +408,18 @@ impl MusicAnalyzer {
                 hf_max = hf_max.max(hf);
                 full_max = full_max.max(ff);
             }
-            prev_mag = Some(logmag);
-            chromas.push(chroma_of(&mag, bin_hz));
-            frame_energy.push(mag.iter().skip(1).map(|&m| m * m).sum());
+            std::mem::swap(&mut self.prev, &mut self.log);
+            self.have_prev = true;
+            chromas.push(chroma_of(&self.mag, bin_hz));
+            frame_energy.push(self.mag.iter().skip(1).map(|&m| m * m).sum());
             stft_index += 1;
-            pos += HOP;
+            pos += hop;
         }
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
 
-        let fps = self.rate as f64 / HOP as f64;
+        let fps = self.rate as f64 / hop as f64;
         let hf_ratio = if full_max > 1e-9 {
             hf_max / full_max
         } else {
@@ -359,20 +431,27 @@ impl MusicAnalyzer {
             fps,
             bpm.map(|b| b.bpm),
             duration_seconds,
-            FFT_LEN as f64 / self.rate as f64,
+            (fft_len + hop / 2) as f64 / self.rate as f64,
         );
         let key = estimate_key(&chromas, &frame_energy);
-        let mut loud = crate::analysis::LoudnessMeter::new(self.rate)?;
-        loud.process(frames)?;
-        let integrated_lufs = loud.reading().integrated_lufs;
-        let energy_curve_db = energy_curve(&mono, self.rate);
-        let silence = silence_segments(&mono, self.rate);
+        // Громкость чанками: длинный проход можно прервать между чанками
+        // (стриминговый счётчик инвариантен к нарезке).
+        let integrated_lufs = self.meter_lufs(frames, cancel)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let (energy_curve_db, energy_step) = energy_curve(frames, self.rate);
+        let silence = silence_segments(frames, self.rate);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         let sections = detect_sections(&chromas, &frame_energy, fps, duration_seconds);
         let transitions = detect_transitions(
             &beats,
             beat_confidence,
             &sections,
             &energy_curve_db,
+            energy_step,
             &silence,
             duration_seconds,
         );
@@ -386,7 +465,7 @@ impl MusicAnalyzer {
             beats,
             beat_confidence,
             key,
-            rms: crate::analysis::rms(frames).unwrap_or([0.0; 2]),
+            rms,
             sample_peak,
             true_peak,
             integrated_lufs,
@@ -395,6 +474,19 @@ impl MusicAnalyzer {
             sections,
             transitions,
         })
+    }
+
+    /// Громкость чанками с проверкой отмены между ними.
+    fn meter_lufs(&self, frames: &[StereoFrame], cancel: &AtomicBool) -> Result<Option<f64>> {
+        let mut loud = crate::analysis::LoudnessMeter::new(self.rate)?;
+        let n = frames.len().div_ceil(4);
+        for chunk in frames.chunks(n.max(1)) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            loud.process(chunk)?;
+        }
+        Ok(loud.reading().integrated_lufs)
     }
 }
 
@@ -410,8 +502,10 @@ pub fn analyze_music(
 fn chroma_of(mag: &[f32], bin_hz: f64) -> [f32; 12] {
     // HPCP-стиль: голосуют только спектральные пики (Essentia отсекает лепестки
     // тем же приёмом), частота — с параболической интерполяцией, вес — энергией.
-    // Октава (2f) безопасна всегда (тот же pitch-класс); 3f не добавляем:
-    // квинта через октаву путает мажор/минор на триадах.
+    // Голос октавы (2f) убран осознанно: semitone(2f) = semitone(f)+12 ровно,
+    // т.е. это равномерный множитель 1.3, сокращающийся в лог-компрессии, —
+    // математический no-op. Отказ от 3f — обоснован: квинта через октаву
+    // путает мажор/минор на триадах.
     let mut chroma = [0.0f32; 12];
     let top_bin = ((5000.0 / bin_hz).floor() as usize).min(mag.len().saturating_sub(2));
     let peak = mag.iter().take(top_bin + 1).copied().fold(0.0f32, f32::max);
@@ -432,14 +526,16 @@ fn chroma_of(mag: &[f32], bin_hz: f64) -> [f32; 12] {
         if freq < 55.0 {
             continue;
         }
-        let w = m * m;
-        vote(&mut chroma, freq, w, 1.0);
-        vote(&mut chroma, freq * 2.0, w, 0.3);
+        // Вес — квадрат ИНТЕРПОЛИРОВАННОЙ амплитуды вершины, а не пикового бина:
+        // иначе везение попадания частоты в центр бина (±30% энергии) решало бы
+        // за тональность вместо формы профиля.
+        let peak_true = (b - 0.25 * (a - c) * shift).max(0.0);
+        vote(&mut chroma, freq, (peak_true * peak_true) as f32);
     }
     chroma
 }
 
-fn vote(chroma: &mut [f32; 12], freq: f64, weight: f32, gain: f32) {
+fn vote(chroma: &mut [f32; 12], freq: f64, weight: f32) {
     if freq <= 0.0 {
         return;
     }
@@ -451,7 +547,7 @@ fn vote(chroma: &mut [f32; 12], freq: f64, weight: f32, gain: f32) {
     }
     // MIDI 60 = C4 → C-базированный pitch-класс.
     let midi_c = ((rounded as i64 - 60).rem_euclid(12)) as usize;
-    chroma[midi_c] += weight * gain * (1.0 - dist as f32);
+    chroma[midi_c] += weight * (1.0 - dist as f32);
 }
 
 fn median(mut v: Vec<f32>) -> f32 {
@@ -512,7 +608,9 @@ fn ioi_tempo(onsets: &[f64]) -> Option<f64> {
     }
     let mut hist = vec![0u32; 212]; // 0.25..1.31 с шагом 5 мс
     for &dt in &dts {
-        hist[((dt - 0.25) / 0.005) as usize] += 1;
+        // Кламп индекса: dt ровно 1.31 даёт 212 — за границей hist.
+        let bin = (((dt - 0.25) / 0.005) as usize).min(hist.len() - 1);
+        hist[bin] += 1;
     }
     let (best, _) = hist
         .iter()
@@ -531,7 +629,7 @@ fn ioi_tempo(onsets: &[f64]) -> Option<f64> {
     Some(60.0 / (near.iter().sum::<f64>() / near.len() as f64))
 }
 
-fn autocorr_best(x: &[f32], fps: f64) -> Option<(f64, f64)> {
+fn autocorr_best(x: &[f32], fps: f64, cancel: &AtomicBool) -> Option<(f64, f64)> {
     // Возвращает (уточнённый лаг в кадрах, лучший счёт).
     if x.len() < 8 {
         return None;
@@ -543,9 +641,12 @@ fn autocorr_best(x: &[f32], fps: f64) -> Option<(f64, f64)> {
         return None;
     }
     let min_lag = ((60.0 / MAX_BPM) * fps).round().max(2.0) as usize;
-    let max_lag = ((60.0 / MIN_BPM) * fps).round() as usize;
+    let max_lag = ((60.0 / MIN_BPM) * fps).floor().max(2.0) as usize;
     let mut scored: Vec<(usize, f64)> = Vec::new();
-    for lag in min_lag..=max_lag.min(y.len() - 2) {
+    for (n, lag) in (min_lag..=max_lag.min(y.len().saturating_sub(2))).enumerate() {
+        if n & 15 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut s = 0.0;
         for i in 0..y.len() - lag {
             s += y[i] * y[i + lag];
@@ -603,7 +704,11 @@ fn estimate_bpm(
     if cmax <= 1e-9 || cmax / rms.max(1e-12) < 3.0 {
         return Ok(None);
     }
-    let Some((lag, _)) = autocorr_best(novelty, fps) else {
+    let Some((lag, _)) = autocorr_best(novelty, fps, cancel) else {
+        // Цикл мог прерваться по отмене — отличить от «пика нет».
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         return Ok(None);
     };
     let mut tempo = 60.0 * fps / lag;
@@ -612,12 +717,10 @@ fn estimate_bpm(
     // Чистый пульс даёт равные пики на 1x/2x: raw≈ioi/2 или raw≈ioi*2 означает,
     // что автокорреляция села на октаву — снапаем raw. Неоктавные расхождения
     // (синкопа с ghost-интервалами) не трогаем.
-    // Кик+хэт даёт победу кику уже в low-band (хэт выше 280 Гц почти не входит).
+    // Кик+хэт даёт победу кику уже в kick-band (хэт выше 160 Гц почти не входит).
     let onsets = onset_times(novelty, fps);
     // IOI — только по сильным долям (≥ половины максимума): слабые subdivision
     // дают октаву вверх и неверный снап.
-    // Возвращает (время, высота) — высота нужна, чтобы IOI строился по сильным
-    // долям (кик), а не по слабым subdivision (хэт).
     let peak_h = onsets.iter().map(|&(_, h)| h).fold(0.0f32, f32::max);
     let strong: Vec<f64> = onsets
         .iter()
@@ -667,7 +770,7 @@ fn autocorr_at(x: &[f32], lag: usize) -> f64 {
 
 fn confidence_of(x: &[f32], fps: f64, lag: f64) -> f64 {
     let min_lag = ((60.0 / MAX_BPM) * fps).round().max(2.0) as usize;
-    let max_lag = ((60.0 / MIN_BPM) * fps).round() as usize;
+    let max_lag = ((60.0 / MIN_BPM) * fps).floor().max(2.0) as usize;
     let mut scores = Vec::new();
     for lag_i in min_lag..=max_lag.min(x.len().saturating_sub(2)) {
         scores.push(autocorr_at(x, lag_i) as f32);
@@ -695,9 +798,10 @@ fn beat_grid(
         return (Vec::new(), 0.0);
     }
     // Фазовый поиск шагом 5 мс по интерполированной огибающей.
-    // Flux кадра i относится к моменту, когда кадр прибыл целиком
-    // (конец окна: i*HOP + FFT_LEN), — конвенция realtime onset detection
-    // (aubio): иначе сетка систематически спешит на длину окна (~85 мс).
+    // Flux кадра относится к изменению, увиденному этим кадром; novelty[k] —
+    // это flux кадра k+1, поэтому привязка — конец окна со сдвигом на полшага:
+    // t(k) = k*HOP + FFT_LEN + HOP/2. Ошибка квантования ±HOP/2 (≤10.7 мс@48k),
+    // а не полный HOP: сдвиг центрирован, а не обрезан вниз.
     let at = |t: f64| -> f32 {
         let pos = (t - frame_end_offset_s) * fps;
         if pos < 0.0 || pos as usize >= novelty.len() {
@@ -813,27 +917,36 @@ fn correlate(avg: &[f64; 12], profile: &[f64; 12], shift: usize) -> f64 {
     num / (da * dr).sqrt().max(1e-18)
 }
 
-fn energy_curve(mono: &[f32], rate: u32) -> Vec<f32> {
+/// RMS в дБ, шаг 100 мс. Возвращает и фактический шаг в секундах
+/// (для нестандартных частот отличается от 0.1 — потребители
+/// обязаны использовать его, а не константу).
+fn energy_curve(frames: &[StereoFrame], rate: u32) -> (Vec<f32>, f64) {
     let step = (rate as f64 * 0.1).round().max(1.0) as usize;
     let mut out = Vec::new();
-    for block in mono.chunks(step) {
-        let rms = (block.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
-            / block.len().max(1) as f64)
-            .sqrt();
-        out.push((20.0 * (rms.max(1e-9)).log10()) as f32);
+    for block in frames.chunks(step) {
+        let power = block
+            .iter()
+            .map(|f| (f[0] as f64).powi(2) + (f[1] as f64).powi(2))
+            .sum::<f64>()
+            / (2 * block.len().max(1)) as f64;
+        out.push((20.0 * (power.sqrt().max(1e-9)).log10()) as f32);
     }
-    out
+    (out, step as f64 / rate as f64)
 }
 
-fn silence_segments(mono: &[f32], rate: u32) -> Vec<Segment> {
+fn silence_segments(frames: &[StereoFrame], rate: u32) -> Vec<Segment> {
+    // Пик — max(|L|, |R|): моно-микс при противофазе даёт ноль на громком сигнале.
     let threshold = 10.0f64.powf(SILENCE_DBFS / 20.0) as f32;
     let step = (rate as f64 * 0.01).round().max(1.0) as usize;
     let min_len = (SILENCE_MIN_SECONDS * rate as f64 / step as f64).ceil() as usize;
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     let mut idx = 0usize;
-    for block in mono.chunks(step) {
-        let peak = block.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    for block in frames.chunks(step) {
+        let peak = block
+            .iter()
+            .map(|f| f[0].abs().max(f[1].abs()))
+            .fold(0.0f32, f32::max);
         if peak < threshold {
             if start.is_none() {
                 start = Some(idx);
@@ -852,7 +965,7 @@ fn silence_segments(mono: &[f32], rate: u32) -> Vec<Segment> {
         if idx - s >= min_len {
             out.push(Segment {
                 start_seconds: s as f64 * step as f64 / rate as f64,
-                end_seconds: (mono.len() as f64) / rate as f64,
+                end_seconds: (frames.len() as f64) / rate as f64,
             });
         }
     }
@@ -860,6 +973,10 @@ fn silence_segments(mono: &[f32], rate: u32) -> Vec<Segment> {
 }
 
 fn detect_sections(chromas: &[[f32; 12]], energy: &[f32], fps: f64, duration: f64) -> Vec<Section> {
+    debug_assert!(energy.len() >= chromas.len());
+    if energy.len() < chromas.len() {
+        return Vec::new();
+    }
     // Признак окна 0.5 с: нормированная chroma + log-энергия. Кластеризация
     // жадным сопоставлением с прототипами (косинус ≥ 0.93), без равномерной нарезки.
     let win = (0.5 * fps).round().max(1.0) as usize;
@@ -950,6 +1067,7 @@ fn detect_transitions(
     beat_confidence: f64,
     sections: &[Section],
     energy_db: &[f32],
+    energy_step_s: f64,
     silence: &[Segment],
     duration: f64,
 ) -> Vec<Transition> {
@@ -992,7 +1110,8 @@ fn detect_transitions(
             confidence: s.confidence,
         });
     }
-    // Энергетические провалы: локальные минимумы ниже 0.3 медианы, снап к биту ±100 мс.
+    // Энергетические провалы: локальные минимумы на 5 дБ ниже медианы
+    // (~0.56× по амплитуде), снап к биту ±100 мс. Время — центр блока.
     if !energy_db.is_empty() && !beats.is_empty() {
         let mut sorted = energy_db.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1006,7 +1125,7 @@ fn detect_transitions(
                 && energy_db[i] <= energy_db[i + 1]
                 && energy_db[i] < med - 5.0
             {
-                let t = i as f64 * 0.1;
+                let t = (i as f64 + 0.5) * energy_step_s;
                 if let Some(&b) = beats.iter().min_by(|a, b| {
                     ((**a - t).abs())
                         .partial_cmp(&((**b - t).abs()))
@@ -1030,8 +1149,24 @@ fn detect_transitions(
             .partial_cmp(&b.at_seconds)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    out.truncate(8);
-    out
+    // MixIn/MixOut резервируются: режутся только границы секций и провалы.
+    let mut core: Vec<Transition> = out
+        .iter()
+        .filter(|t| matches!(t.kind, TransitionKind::MixIn | TransitionKind::MixOut))
+        .copied()
+        .collect();
+    let mut rest: Vec<Transition> = out
+        .into_iter()
+        .filter(|t| !matches!(t.kind, TransitionKind::MixIn | TransitionKind::MixOut))
+        .collect();
+    rest.truncate(6);
+    core.append(&mut rest);
+    core.sort_by(|a, b| {
+        a.at_seconds
+            .partial_cmp(&b.at_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    core
 }
 
 #[cfg(test)]
@@ -1111,6 +1246,81 @@ mod tests {
         out
     }
 
+    fn kick_hat_split(sync: f64, seconds: f64, rate: u32) -> Vec<StereoFrame> {
+        // Кик только слева, хэт только справа — проверка стерео-микса.
+        let n = (seconds * rate as f64) as usize;
+        let mut out = vec![[0.0; 2]; n];
+        let beat = 60.0 / sync * rate as f64;
+        let mut k = 0usize;
+        loop {
+            let pos = (k as f64 * beat).round() as usize;
+            if pos + 512 >= n {
+                break;
+            }
+            for i in 0..512 {
+                let env = (-(i as f32) / 120.0).exp();
+                let s = 0.8
+                    * env
+                    * (2.0 * std::f64::consts::PI * 60.0 * i as f64 / rate as f64).sin() as f32;
+                out[pos + i][0] += s;
+            }
+            let off = (pos as f64 + beat / 2.0).round() as usize;
+            if off + 32 < n {
+                let mut x: u64 = 0x12345678 + k as u64;
+                for i in 0..32 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(21);
+                    let nz = ((x >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.2;
+                    out[off + i][1] += nz;
+                }
+            }
+            k += 1;
+        }
+        out
+    }
+
+    /// Half-time feel: кик на 1 и 3 + хэт на восьмых. Доминирующий пульс —
+    /// половина сетки; движок сообщает пульс 70, сетка строится на 140.
+    fn half_time_groove(bpm: f64, seconds: f64, rate: u32) -> Vec<StereoFrame> {
+        let n = (seconds * rate as f64) as usize;
+        let mut out = vec![[0.0; 2]; n];
+        let beat = 60.0 / bpm * rate as f64;
+        let mut bar = 0usize;
+        loop {
+            for half in [0, 2] {
+                let pos = ((bar * 4 + half) as f64 * beat).round() as usize;
+                if pos + 512 >= n {
+                    continue;
+                }
+                for i in 0..512 {
+                    let env = (-(i as f32) / 120.0).exp();
+                    let s = 0.8
+                        * env
+                        * (2.0 * std::f64::consts::PI * 60.0 * i as f64 / rate as f64).sin() as f32;
+                    out[pos + i][0] += s;
+                    out[pos + i][1] += s;
+                }
+            }
+            for e in 0..8 {
+                let off = (bar as f64 * 4.0 * beat + e as f64 * beat / 2.0).round() as usize;
+                if off + 32 >= n {
+                    continue;
+                }
+                let mut x: u64 = 0xabcdef + (bar * 8 + e) as u64;
+                for i in 0..32 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(21);
+                    let nz = ((x >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.2;
+                    out[off + i][0] += nz;
+                    out[off + i][1] += nz;
+                }
+            }
+            bar += 1;
+            if (bar as f64 * 4.0 * beat) as usize + 512 >= n {
+                break;
+            }
+        }
+        out
+    }
+
     fn chord_tone(freqs: &[f64], seconds: f64, rate: u32) -> Vec<StereoFrame> {
         let n = (seconds * rate as f64) as usize;
         (0..n)
@@ -1143,6 +1353,17 @@ mod tests {
         let err = ((got - expected) / expected).abs();
         assert!(err <= 0.01, "expected {expected}, got {got} (err {err})");
         assert!(!a.beats.is_empty());
+        // Сетка согласована с BPM: медианный интервал ≈ период (допуск 3%).
+        if a.beats.len() >= 4 {
+            let mut gaps: Vec<f64> = a.beats.windows(2).map(|w| w[1] - w[0]).collect();
+            gaps.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let med = gaps[gaps.len() / 2];
+            let period = 60.0 / got;
+            assert!(
+                ((med - period) / period).abs() <= 0.03,
+                "beat period {med} vs {period}"
+            );
+        }
     }
 
     #[test]
@@ -1207,7 +1428,33 @@ mod tests {
         }
         let a = analyze_music(&drift, rate, &no_cancel()).unwrap();
         let got = a.bpm.expect("drift bpm").bpm;
-        assert!((115.0..=145.0).contains(&got), "drift {got}");
+        // Дрейф 120→140: отслеживание near-mean (не залипание на краях).
+        assert!((124.0..=136.0).contains(&got), "drift {got}");
+    }
+
+    #[test]
+    fn bpm_half_double_feel_and_split_stereo() {
+        let rate = 48_000;
+        // Half-time feel: кик на 1 и 3 + хэт на восьмых @140.
+        // Конвенция движка: сообщается доминантный пульс (70), не сетка.
+        // Удвоение по жанровому приору — задача Automix (GATE 3).
+        let frames = half_time_groove(140.0, 10.0, rate);
+        let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+        let got = a.bpm.expect("half-time pulse").bpm;
+        assert!(((got - 70.0) / 70.0).abs() <= 0.01, "half-time {got}");
+        // Сплит-стерео: кик слева, хэт справа — моно-микс сохраняет оба.
+        check_bpm(&kick_hat_split(120.0, 8.0, rate), rate, 120.0);
+        // Противофаза: моно-микс даёт ноль — ритма и тональности нет
+        // (зафиксировано как ограничение; тишина при этом НЕ детектируется,
+        // т.к. детектор смотрит max(|L|,|R|)).
+        let anti: Vec<StereoFrame> = sine(440.0, 4.0, rate, 0.5)
+            .into_iter()
+            .map(|[l, _]| [l, -l])
+            .collect();
+        let a = analyze_music(&anti, rate, &no_cancel()).unwrap();
+        assert!(a.bpm.is_none());
+        assert!(a.key.is_none());
+        assert!(a.silence.is_empty(), "anti-phase is loud: {:?}", a.silence);
     }
 
     #[test]
@@ -1225,6 +1472,9 @@ mod tests {
     }
 
     fn median_beat_error(beats: &[f64], refs: &[f64]) -> f64 {
+        if beats.is_empty() || refs.is_empty() {
+            return f64::INFINITY;
+        }
         let mut errs: Vec<f64> = beats
             .iter()
             .map(|b| {
@@ -1239,34 +1489,100 @@ mod tests {
 
     #[test]
     fn beatgrid_median_error_under_20ms() {
-        for bpm in [90.0, 120.0, 140.0] {
-            let rate = 48_000;
-            let frames = click_train(bpm, 10.0, rate, false);
-            let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
-            let period = 60.0 / bpm;
-            let refs: Vec<f64> = (0..(10.0 / period) as usize)
-                .map(|k| k as f64 * period)
-                .collect();
-            let err = median_beat_error(&a.beats, &refs);
-            assert!(err <= 0.020, "bpm {bpm}: median err {err}");
+        // Все крайние темпы × все частоты дискретизации + kick/hat-грув.
+        for rate in [44_100, 48_000, 96_000] {
+            for bpm in [60.0, 90.0, 120.0, 140.0, 174.0] {
+                let frames = click_train(bpm, 10.0, rate, false);
+                let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+                let period = 60.0 / bpm;
+                let refs: Vec<f64> = (0..(10.0 / period) as usize)
+                    .map(|k| k as f64 * period)
+                    .collect();
+                let err = median_beat_error(&a.beats, &refs);
+                assert!(err <= 0.020, "rate {rate} bpm {bpm}: median err {err}");
+            }
         }
+        let groovy = kick_hat(128.0, 8.0, 48_000);
+        let a = analyze_music(&groovy, 48_000, &no_cancel()).unwrap();
+        let refs: Vec<f64> = (0..17).map(|k| k as f64 * 60.0 / 128.0).collect();
+        let err = median_beat_error(&a.beats, &refs);
+        assert!(err <= 0.020, "kick_hat grid err {err}");
     }
 
     #[test]
     fn key_unambiguous_chords() {
-        // C–E–G → C major; A–C–E → A minor (A3/C4/E4).
-        let cases = [
-            (vec![261.63, 329.63, 392.00], PitchClass::C, Mode::Major),
-            (vec![220.00, 261.63, 329.63], PitchClass::A, Mode::Minor),
-            (vec![392.00, 493.88, 587.33], PitchClass::G, Mode::Major),
-            (vec![329.63, 392.00, 493.88], PitchClass::E, Mode::Minor),
-        ];
-        for (freqs, tonic, mode) in cases {
-            let frames = chord_tone(&freqs, 5.0, 48_000);
-            let a = analyze_music(&frames, 48_000, &no_cancel()).unwrap();
-            let key = a.key.expect("key must be detected");
-            assert_eq!(key.tonic, tonic, "freqs {freqs:?}");
-            assert_eq!(key.mode, mode);
+        // Все 12 тоник × мажор/минор, корневое положение, чистые синусы.
+        // Частота тоники: C4=261.63, далее полутона; терция/квинта от неё.
+        for tonic in 0..12 {
+            let f0 = 261.63 * 2.0f64.powf(tonic as f64 / 12.0);
+            let third_major = f0 * 2.0f64.powf(4.0 / 12.0);
+            let third_minor = f0 * 2.0f64.powf(3.0 / 12.0);
+            let fifth = f0 * 2.0f64.powf(7.0 / 12.0);
+            for (freqs, mode) in [
+                (vec![f0, third_major, fifth], Mode::Major),
+                (vec![f0, third_minor, fifth], Mode::Minor),
+            ] {
+                let frames = chord_tone(&freqs, 4.0, 48_000);
+                let a = analyze_music(&frames, 48_000, &no_cancel()).unwrap();
+                let key = a.key.expect("key must be detected");
+                assert_eq!(key.tonic, PitchClass::from_semitone(tonic), "mode {mode:?}");
+                assert_eq!(key.mode, mode);
+            }
+        }
+        // Обращения не меняют pitch-классы → та же тональность.
+        let inv = chord_tone(&[329.63, 392.00, 523.25], 4.0, 48_000); // E4 G4 C5
+        let a = analyze_music(&inv, 48_000, &no_cancel()).unwrap();
+        let key = a.key.expect("inversion key");
+        assert_eq!((key.tonic, key.mode), (PitchClass::C, Mode::Major));
+        // С октавными удвоениями (k=1..2): тембр богаче, чужеродных тонов нет.
+        // 3-я+ гармоники (квинты: G/B поверх Am) — осознанно вне строгого гейта:
+        // гармонический ряд минорной триады естественно красит её в сторону
+        // относительного мажора, разборчивость калибруется на реальной музыке.
+        let rich: Vec<StereoFrame> = (0..48_000 * 4)
+            .map(|i| {
+                let mut s = 0.0f32;
+                for &f in &[220.0, 261.63, 329.63] {
+                    for k in 1..=2 {
+                        s += ((2.0 * std::f64::consts::PI * f * k as f64 * i as f64 / 48_000.0)
+                            .sin() as f32)
+                            / k as f32;
+                    }
+                }
+                s *= 0.15;
+                [s, s]
+            })
+            .collect();
+        let a = analyze_music(&rich, 48_000, &no_cancel()).unwrap();
+        let key = a.key.expect("rich timbre key");
+        assert_eq!((key.tonic, key.mode), (PitchClass::A, Mode::Minor));
+        // Шум и 12-тоновый кластер: тональности нет.
+        let noise = xorshift_noise(5.0, 48_000);
+        assert!(
+            analyze_music(&noise, 48_000, &no_cancel())
+                .unwrap()
+                .key
+                .is_none()
+        );
+        let cluster: Vec<f64> = (0..12)
+            .map(|s| 261.63 * 2.0f64.powf(s as f64 / 12.0))
+            .collect();
+        let frames = chord_tone(&cluster, 4.0, 48_000);
+        assert!(
+            analyze_music(&frames, 48_000, &no_cancel())
+                .unwrap()
+                .key
+                .is_none()
+        );
+        // Другая частота дискретизации: C major + A minor на 44.1/96 кГц.
+        for rate in [44_100, 96_000] {
+            let frames = chord_tone(&[261.63, 329.63, 392.00], 4.0, rate);
+            let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+            let key = a.key.expect("key at rate");
+            assert_eq!((key.tonic, key.mode), (PitchClass::C, Mode::Major));
+            let frames = chord_tone(&[220.00, 261.63, 329.63], 4.0, rate);
+            let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+            let key = a.key.expect("key at rate");
+            assert_eq!((key.tonic, key.mode), (PitchClass::A, Mode::Minor));
         }
     }
 
@@ -1280,15 +1596,16 @@ mod tests {
         assert!(a.key.is_none());
         assert!(a.integrated_lufs.is_none());
         assert_eq!(a.silence.len(), 1);
-        // Шум: без паники, BPM либо нет, либо с низкой уверенностью.
+        // Шум: ритма нет (None) и тональности нет — гейты зафиксированы строго.
         let noise = xorshift_noise(6.0, rate);
         let a = analyze_music(&noise, rate, &no_cancel()).unwrap();
-        assert!(a.bpm.is_none_or(|b| b.confidence < 0.9));
+        assert!(a.bpm.is_none(), "noise bpm: {:?}", a.bpm);
+        assert!(a.key.is_none(), "noise key: {:?}", a.key);
         // Пауза без выраженного ритма: аккорд-пауза — тональность есть, ритма нет.
         let pad = chord_tone(&[261.63, 329.63, 392.00], 6.0, rate);
         let a = analyze_music(&pad, rate, &no_cancel()).unwrap();
         assert!(a.key.is_some());
-        assert!(a.bpm.is_none_or(|b| b.confidence < 0.6));
+        assert!(a.bpm.is_none(), "pad bpm: {:?}", a.bpm);
     }
 
     #[test]
@@ -1309,8 +1626,11 @@ mod tests {
 
     #[test]
     fn lufs_streaming_matches_offline_reference() {
-        // Независимый эталон BS.1770 в тесте: те же K-фильтры, но цельный расчёт
-        // (f64, блочная средняя мощность, гейты -70/-10). Расхождение ≤ 0.5 LU.
+        // Перекрёстный эталон BS.1770 в тесте (НЕ независимый: коэффициенты
+        // K-фильтров повторяют формулы стандарта теми же числами, поэтому
+        // опечатки в константах он не ловит). Проверяет бухгалтерию стриминга:
+        // кольцевой буфер, шаг блоков 100 мс, двухступенчатые гейты -70/-10.
+        // Независимая проверка констант — тест lufs_known_answer_sines ниже.
         let rate = 48_000;
         let frames = sine(440.0, 6.0, rate, 0.5);
         let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
@@ -1322,11 +1642,94 @@ mod tests {
         );
         assert!((a.sample_peak - 0.5).abs() < 0.01);
         assert!(a.true_peak + 1e-6 >= a.sample_peak);
+        // Та же фикстура на 44.1/96 кГц: результат стабилен в пределах 0.5 LU.
+        for rate in [44_100, 96_000] {
+            let frames = sine(440.0, 6.0, rate, 0.5);
+            let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+            let got = a.integrated_lufs.expect("lufs");
+            assert!(
+                (got - expected).abs() <= 0.6,
+                "rate {rate}: got {got}, reference {expected}"
+            );
+        }
     }
 
-    /// Независимый эталон BS.1770 в тесте: те же K-фильтры по формулам стандарта,
+    #[test]
+    fn lufs_known_answer_sines() {
+        // Закрытая формула BS.1770 для стерео-синуса амплитуды A:
+        // LUFS ≈ -0.691 + 10·log10(A²) + K(f), где K — АЧХ K-фильтра.
+        // K(1 кГц) = +0.68 дБ (посчитано по передаточной функции RLB2-полки:
+        // |H(1кГц)| = 1.081 при fs=48 кГц), K(8 кГц) ≈ +3.9 дБ (почти полка).
+        // Литералы — из АЧХ стандартного фильтра; неверная полка/знак
+        // в прод-коде дают уход >0.5 (проверено: -6.6 вместо -6.0 не проходит).
+        for (freq, expected) in [(1000.0, -6.0), (8000.0, -2.8)] {
+            let frames = sine(freq, 5.0, 48_000, 0.5);
+            let a = analyze_music(&frames, 48_000, &no_cancel()).unwrap();
+            let got = a.integrated_lufs.expect("lufs");
+            assert!(
+                (got - expected).abs() <= 0.5,
+                "f={freq}: got {got}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn true_peak_catches_inter_sample_overshoot() {
+        // Синус fs/4 с фазой π/4: отсчёты ±0.707, истинный пик 1.0 между ними.
+        // Линейная интерполяция этого не видит (выпуклая комбинация ≤ max),
+        // парабола по тройке — видит.
+        let rate = 48_000;
+        let n = rate as usize * 2;
+        let frames: Vec<StereoFrame> = (0..n)
+            .map(|i| {
+                let s = (2.0 * std::f64::consts::PI * 12_000.0 * i as f64 / rate as f64
+                    + std::f64::consts::FRAC_PI_4)
+                    .sin() as f32
+                    * 0.9;
+                [s, s]
+            })
+            .collect();
+        let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+        assert!(
+            (a.sample_peak - 0.9 * std::f64::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "sample {}",
+            a.sample_peak
+        );
+        assert!(
+            a.true_peak > a.sample_peak + 0.1,
+            "true {} vs sample {}",
+            a.true_peak,
+            a.sample_peak
+        );
+        assert!(a.true_peak <= 0.95, "overshoot {}", a.true_peak);
+    }
+
+    #[test]
+    fn silence_boundaries_and_levels() {
+        let rate = 48_000;
+        let tone = |dbfs: f64, seconds: f64| {
+            let amp = 10.0f64.powf(dbfs / 20.0) as f32;
+            let n = (seconds * rate as f64) as usize;
+            vec![[amp, amp]; n]
+        };
+        // −50 dBFS громче порога: сегмента нет даже на длинной паузе.
+        let a = analyze_music(&tone(-50.0, 1.0), rate, &no_cancel()).unwrap();
+        assert!(a.silence.is_empty());
+        // −70 dBFS 300 мс: ровно один сегмент; 100 мс: нет (минимум 200 мс).
+        let mut frames = tone(-70.0, 0.3);
+        frames.extend(tone(-50.0, 0.5));
+        frames.extend(tone(-70.0, 0.1));
+        let a = analyze_music(&frames, rate, &no_cancel()).unwrap();
+        assert_eq!(a.silence.len(), 1, "silence: {:?}", a.silence);
+        assert!((a.silence[0].start_seconds - 0.0).abs() < 0.05);
+        assert!((a.silence[0].end_seconds - 0.3).abs() < 0.05);
+    }
+
+    /// Перекрёстный эталон BS.1770 в тесте: K-фильтры по формулам стандарта,
     /// но цельный расчёт своим кодом (f64, блочная средняя мощность, гейты -70/-10).
-    /// Проверяет streaming-логику `LoudnessMeter`, а не дублирует её.
+    /// Проверяет streaming-бухгалтерию `LoudnessMeter`, а не дублирует её.
+    /// Опечатки в константах фильтров этот тест НЕ ловит (формулы те же) —
+    /// их ловит lufs_known_answer_sines.
     fn reference_lufs(frames: &[StereoFrame], rate: u32) -> f64 {
         #[derive(Clone, Copy)]
         struct Bq {
@@ -1468,11 +1871,78 @@ mod tests {
             .analyze(&click_train(120.0, 6.0, rate, false), &cancel)
             .unwrap();
         core.reset();
+        // Другой темп после reset: сброс очищает состояние, а не залипает.
         let a2 = core
-            .analyze(&click_train(120.0, 6.0, rate, false), &cancel)
+            .analyze(&click_train(140.0, 6.0, rate, false), &cancel)
             .unwrap();
-        assert_eq!(a1.bpm.unwrap().bpm, a2.bpm.unwrap().bpm);
+        assert!(((a1.bpm.unwrap().bpm - 120.0) / 120.0).abs() <= 0.01);
+        assert!(((a2.bpm.unwrap().bpm - 140.0) / 140.0).abs() <= 0.01);
         assert_eq!(a1.version, ANALYSIS_VERSION);
-        assert_eq!(a1.beats.len(), a2.beats.len());
+    }
+
+    #[test]
+    fn input_limit_is_seconds_based() {
+        // 300 с на любой частоте + абсолютный потолок 28.8M кадров.
+        assert!(check_len(14_400_000, 48_000).is_ok());
+        assert!(check_len(14_400_001, 48_000).is_err());
+        assert!(check_len(17_280_000, 96_000).is_ok()); // 180 с @96 кГц
+        assert!(check_len(28_800_000, 96_000).is_ok()); // ровно 300 с @96 кГц
+        assert!(check_len(28_800_001, 48_000).is_err()); // потолок
+        assert!(check_len(0, 48_000).is_ok());
+        assert!(analyze_music(&vec![[0.0; 2]; 100], 8_000, &no_cancel()).is_ok());
+    }
+
+    #[test]
+    fn estimate_bpm_honors_cancel_and_gates() {
+        // Искусственная огибающая: пики каждые 23 кадра (fps 46.875 → ~122 BPM).
+        // DC складывается ЯВНО со всеми сэмплами (без скобок `+ dc` ушёл бы
+        // только в else-ветку).
+        let spike = |dc: f32| {
+            (0..500)
+                .map(|i| (if i % 23 == 0 { 10.0 } else { 0.0 }) + dc)
+                .collect::<Vec<f32>>()
+        };
+        // Предустановленная отмена — Err до вычислений.
+        assert!(estimate_bpm(&spike(0.0), 46.875, &AtomicBool::new(true), 1.0).is_err());
+        // Крест ниже порога (DC=4 → 2.86) — None, выше (DC=0 → 4.77) — Some.
+        assert!(
+            estimate_bpm(&spike(4.0), 46.875, &no_cancel(), 1.0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            estimate_bpm(&spike(0.0), 46.875, &no_cancel(), 1.0)
+                .unwrap()
+                .is_some()
+        );
+        // ВЧ-гейт: 0.019 — None, 0.021 — пропуск дальше.
+        assert!(
+            estimate_bpm(&spike(0.0), 46.875, &no_cancel(), 0.019)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            estimate_bpm(&spike(0.0), 46.875, &no_cancel(), 0.021)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancellation_mid_stream() {
+        // Флаг выставляется из второго потока во время длинного STFT-прохода.
+        use std::sync::atomic::Ordering;
+        let rate = 48_000;
+        let frames = click_train(120.0, 60.0, rate, false);
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            let err = analyze_music(&frames, rate, &cancel).unwrap_err();
+            assert!(matches!(err, Error::Cancelled));
+        });
     }
 }
