@@ -330,6 +330,12 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     if matches!(query.source, catalog::Source::Spotify) {
+        if query.q.trim().is_empty() {
+            return Ok(Json(catalog::Search {
+                tracks: Vec::new(),
+                notice: Some("Введи название или имя артиста.".into()),
+            }));
+        }
         return Ok(Json(spotify_search(&app, &query.q).await));
     }
     if !matches!(query.source, catalog::Source::All) || query.q.trim().is_empty() {
@@ -478,18 +484,56 @@ async fn stream(
 
 /// Прокси SoundCloud: свежая подписанная ссылка получается на каждый запрос,
 /// байты идут через сервер (работает и там, где CDN источника недоступен клиенту).
+/// Параллельные потоки SoundCloud ограничены: каждый держит исходящее
+/// соединение до 120 с, без семафора скрипт перебора id положит сеть.
+static SC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
+/// Один диапазон `bytes=start-end`, `bytes=start-` или `bytes=-suffix`.
+/// Мультидиапазоны отклоняются: плеер их не запрашивает.
+fn valid_range(value: Option<&axum::http::HeaderValue>) -> bool {
+    let Some(value) = value.and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return false;
+    };
+    if spec.contains(',') {
+        return false;
+    }
+    let (start, end) = match spec.split_once('-') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let number = |s: &str| s.is_empty() || s.bytes().all(|b| b.is_ascii_digit());
+    number(start) && number(end) && !(start.is_empty() && end.is_empty())
+}
+
 async fn source_sc(
     State(app): State<App>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
     use axum::http::header;
-    if id.is_empty() || id.len() > 12 || !id.bytes().all(|b| b.is_ascii_digit()) {
+    if !core_streaming::soundcloud::valid_id(&id) {
         return ApiError::missing("Запись SoundCloud не найдена.").into_response();
+    }
+    if !valid_range(request.headers().get(header::RANGE)) {
+        return ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "Некорректный диапазон.")
+            .into_response();
     }
     if app.catalog.track(&format!("sc-{id}")).await.is_none() {
         return ApiError::missing("Запись SoundCloud не найдена.").into_response();
     }
+    let _permit = match SC_SLOTS.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Слишком много потоков. Повтори через несколько секунд.",
+            )
+            .into_response();
+        }
+    };
     let stream = match app.catalog.soundcloud_client().resolve(&id).await {
         Ok(stream) => stream,
         Err(error) => return ApiError::from(error).into_response(),

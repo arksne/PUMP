@@ -227,7 +227,16 @@ impl DownloadManager {
                     .map_err(|_| Error::Limit("время ожидания обложки".into()))??
                     .error_for_status()?;
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
+            loop {
+                let chunk: Option<_> = tokio::select! {
+                    r = tokio::time::timeout(Duration::from_secs(30), response.chunk()) => {
+                        r.map_err(|_| Error::Limit("время ожидания обложки".into()))??
+                    }
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
                 if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
                     return Err(Error::Limit("обложка".into()));
                 }

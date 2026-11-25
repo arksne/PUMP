@@ -34,18 +34,23 @@ impl LyricsClient {
                 sources: Vec::new(),
             });
         }
+        // Оба источника ограничены суммарно: медленный ответ не держит запрос.
         let timed = async {
-            let r = tokio::time::timeout(
-                SOURCE_TIMEOUT,
-                self.http
+            tokio::time::timeout(SOURCE_TIMEOUT, async {
+                let r = self
+                    .http
                     .get("https://lrclib.net/api/get")
                     .query(&[("artist_name", artist), ("track_name", title)])
-                    .send(),
-            )
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                Ok::<Value, reqwest::Error>(r)
+            })
             .await
             .ok()?
-            .ok()?;
-            r.error_for_status().ok()?.json::<Value>().await.ok()
+            .ok()
         };
         let plain = async {
             let url = format!(
@@ -53,11 +58,20 @@ impl LyricsClient {
                 component(artist),
                 component(title)
             );
-            let r = tokio::time::timeout(SOURCE_TIMEOUT, self.http.get(url).send())
-                .await
-                .ok()?
-                .ok()?;
-            r.error_for_status().ok()?.json::<Value>().await.ok()
+            tokio::time::timeout(SOURCE_TIMEOUT, async {
+                let r = self
+                    .http
+                    .get(url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                Ok::<Value, reqwest::Error>(r)
+            })
+            .await
+            .ok()?
+            .ok()
         };
         let (timed, plain) = tokio::join!(timed, plain);
         let mut result = LyricsResult {

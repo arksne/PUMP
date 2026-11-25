@@ -40,7 +40,9 @@ impl SpotifyAppClient {
     }
 
     async fn bearer(&self) -> Result<String> {
-        if let Some(cached) = self.token.lock().await.as_ref().filter(|t| {
+        // Single-flight: мьютекс удерживается и на время запроса токена.
+        let mut slot = self.token.lock().await;
+        if let Some(cached) = slot.as_ref().filter(|t| {
             t.expires_at > Instant::now() + Duration::from_secs(30) && !t.value.is_empty()
         }) {
             return Ok(cached.value.clone());
@@ -64,22 +66,16 @@ impl SpotifyAppClient {
             .ok_or_else(|| Error::Protocol("Spotify не вернул токен приложения".into()))?;
         let expires_in = data["expires_in"].as_u64().unwrap_or(3600).clamp(60, 3600);
         let value = token.to_owned();
-        *self.token.lock().await = Some(CachedToken {
+        *slot = Some(CachedToken {
             value: value.clone(),
             expires_at: Instant::now() + Duration::from_secs(expires_in),
         });
         Ok(value)
     }
 
-    /// Метаданные треков для сопоставления с каталогом. Звука здесь нет.
-    pub async fn search_tracks(&self, query: &str, limit: u8) -> Result<Vec<TrackMetadata>> {
-        let query = query.trim();
-        if query.is_empty() || query.chars().count() > 140 {
-            return Err(Error::Invalid("Поисковый запрос слишком длинный".into()));
-        }
+    async fn search_once(&self, query: &str, limit: u8) -> Result<reqwest::Response> {
         let token = self.bearer().await?;
-        let data: Value = self
-            .http
+        self.http
             .get("https://api.spotify.com/v1/search")
             .bearer_auth(token)
             .query(&[
@@ -89,7 +85,24 @@ impl SpotifyAppClient {
             ])
             .send()
             .await
-            .map_err(|_| Error::Protocol("Поиск Spotify недоступен".into()))?
+            .map_err(|_| Error::Protocol("Поиск Spotify недоступен".into()))
+    }
+
+    /// Метаданные треков для сопоставления с каталогом. Звука здесь нет.
+    pub async fn search_tracks(&self, query: &str, limit: u8) -> Result<Vec<TrackMetadata>> {
+        let query = query.trim();
+        if query.is_empty() || query.chars().count() > 140 {
+            return Err(Error::Invalid("Поисковый запрос слишком длинный".into()));
+        }
+        let response = self.search_once(query, limit).await?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // Токен могли отозвать раньше expires_in: сбросить и повторить один раз.
+            *self.token.lock().await = None;
+            self.search_once(query, limit).await?
+        } else {
+            response
+        };
+        let data: Value = response
             .error_for_status()
             .map_err(|_| Error::Protocol("Поиск Spotify недоступен".into()))?
             .json()

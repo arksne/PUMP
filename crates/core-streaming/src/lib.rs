@@ -404,19 +404,22 @@ impl Catalog {
         if let Some(item) = self.fixed.get(id) {
             return Some(item.clone());
         }
-        let cache = self.lookup.read().await;
-        if let Some((registered, item)) = cache.get(id)
-            && registered.elapsed() < Duration::from_secs(6 * 3600)
-        {
-            return Some(item.clone());
+        // Guard живёт только внутри блока: иначе read-lock через сетевой
+        // await заблокирует write() ниже (вечный deadlock той же задачи).
+        let cached = {
+            let cache = self.lookup.read().await;
+            cache
+                .get(id)
+                .filter(|(registered, _)| registered.elapsed() < Duration::from_secs(6 * 3600))
+                .map(|(_, item)| item.clone())
+        };
+        if let Some(item) = cached {
+            return Some(item);
         }
         if let Some(video) = id.strip_prefix("yt-").filter(|id| valid_video(id)) {
             return Some(youtube_track(video, "Видео YouTube", ""));
         }
-        if let Some(numeric) = id
-            .strip_prefix("sc-")
-            .filter(|n| !n.is_empty() && n.len() <= 12 && n.bytes().all(|b| b.is_ascii_digit()))
-        {
+        if let Some(numeric) = id.strip_prefix("sc-").filter(|n| soundcloud::valid_id(n)) {
             // Комнаты и статистика принимают трек без предварительного поиска:
             // метаданные подтягиваются с источника и живут в lookup-кэше 6 часов.
             if let Ok(meta) = self.soundcloud.track(numeric).await
@@ -473,7 +476,7 @@ impl Catalog {
             if let Some((provider, unavailable)) = remote {
                 match self.remote(provider, term).await {
                     Ok(mut results) => tracks.append(&mut results),
-                    Err(()) => notice = Some(unavailable.into()),
+                    Err(custom) => notice = Some(custom.unwrap_or(unavailable).into()),
                 }
             }
         } else if matches!(
@@ -485,7 +488,7 @@ impl Catalog {
         Ok(Search { tracks, notice })
     }
 
-    async fn remote(&self, source: Source, term: &str) -> Result<Vec<Track>, ()> {
+    async fn remote(&self, source: Source, term: &str) -> Result<Vec<Track>, Option<&'static str>> {
         let key = (
             match source {
                 Source::Youtube => 1,
@@ -505,9 +508,9 @@ impl Catalog {
             return Ok(result);
         }
         let tracks = match source {
-            Source::Youtube => self.youtube(term).await?,
+            Source::Youtube => self.youtube(term).await.map_err(|_| None)?,
             Source::Soundcloud => self.soundcloud_search(term).await?,
-            _ => self.preview(term).await?,
+            _ => self.preview(term).await.map_err(|_| None)?,
         };
         let now = Instant::now();
         let mut cache = self.queries.write().await;
@@ -635,15 +638,18 @@ impl Catalog {
         &self.soundcloud
     }
 
-    async fn soundcloud_search(&self, term: &str) -> Result<Vec<Track>, ()> {
+    async fn soundcloud_search(&self, term: &str) -> Result<Vec<Track>, Option<&'static str>> {
         if soundcloud::canonical_track_link(term).is_some() {
-            let (meta, _) = self.soundcloud.resolve_url(term).await.map_err(|_| ())?;
+            let (meta, _) = self.soundcloud.resolve_url(term).await.map_err(|_| None)?;
             if meta.playback != soundcloud::Playback::Full {
-                return Err(());
+                // Не сбой сети, а отсутствие открытого потока: честное уведомление.
+                return Err(Some(
+                    "Для этой записи нет открытого аудиопотока SoundCloud.",
+                ));
             }
             return Ok(vec![soundcloud_track(&meta)]);
         }
-        let metas = self.soundcloud.search(term, 12).await.map_err(|_| ())?;
+        let metas = self.soundcloud.search(term, 12).await.map_err(|_| None)?;
         Ok(metas
             .iter()
             .filter(|m| m.playback == soundcloud::Playback::Full)

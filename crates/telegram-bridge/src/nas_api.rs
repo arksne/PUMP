@@ -12,7 +12,7 @@ use axum::{
 use library_storage::{NetworkMode, nas::WebDav};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 #[derive(Clone, Deserialize)]
@@ -171,6 +171,22 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
     }
     Ok(())
 }
+/// Тело WebDAV с простоем не дольше 30 с: зависший NAS не держит
+/// соединение и слот семафора вечно. Таймаут рвёт стрим целиком.
+fn nas_body<S>(
+    stream: S,
+) -> impl futures_util::StreamExt<Item = Result<axum::body::Bytes, std::io::Error>>
+where
+    S: futures_util::StreamExt<Item = Result<axum::body::Bytes, reqwest::Error>>,
+{
+    use futures_util::StreamExt as _;
+    stream.timeout(Duration::from_secs(30)).map(|chunk| {
+        chunk
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "простой потока NAS"))?
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+    })
+}
+
 pub(crate) async fn stream(
     State(app): State<App>,
     Path(token): Path<String>,
@@ -223,7 +239,7 @@ pub(crate) async fn stream(
                 }
             }
             builder
-                .body(Body::from_stream(response.bytes_stream()))
+                .body(Body::from_stream(nas_body(response.bytes_stream())))
                 .map_err(|_| ApiError::unavailable("Некорректный ответ WebDAV."))
         }
         #[cfg(feature = "smb")]
@@ -276,9 +292,12 @@ pub(crate) async fn stream(
                         file.close().await?;
                         return Ok::<_, library_storage::Error>(None);
                     }
-                    let bytes = file
-                        .read_at(offset, (end - offset).min(256 * 1024) as usize)
-                        .await?;
+                    let bytes = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        file.read_at(offset, (end - offset).min(256 * 1024) as usize),
+                    )
+                    .await
+                    .map_err(|_| library_storage::Error::Limit("время ожидания SMB".into()))??;
                     if bytes.is_empty() {
                         return Err(library_storage::Error::Invalid(
                             "SMB EOF before expected range".into(),

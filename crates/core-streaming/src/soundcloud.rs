@@ -15,10 +15,11 @@
 use crate::ApiError;
 use serde_json::Value;
 use std::{
-    sync::Mutex,
+    collections::HashMap,
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 const DEFAULT_API: &str = "https://api-v2.soundcloud.com";
 const HOME: &str = "https://soundcloud.com/";
@@ -97,7 +98,13 @@ pub struct SoundCloudClient {
     fixed: Option<String>,
     api: String,
     id: Mutex<Option<CachedId>>,
+    /// Отрицательный кэш: не дергать api-v2 по несуществующим id.
+    /// TTL короткий, чтобы ожившие записи подхватывались.
+    neg: Mutex<HashMap<String, Instant>>,
 }
+
+const NEG_TTL: Duration = Duration::from_secs(5 * 60);
+const NEG_CAP: usize = 512;
 
 impl SoundCloudClient {
     pub fn new(http: reqwest::Client) -> Self {
@@ -106,6 +113,7 @@ impl SoundCloudClient {
             fixed: None,
             api: api_base(),
             id: Mutex::default(),
+            neg: Mutex::default(),
         }
     }
 
@@ -120,6 +128,7 @@ impl SoundCloudClient {
             fixed,
             api: api_base(),
             id: Mutex::default(),
+            neg: Mutex::default(),
         }
     }
 
@@ -127,28 +136,26 @@ impl SoundCloudClient {
         if let Some(fixed) = &self.fixed {
             return Ok(fixed.clone());
         }
-        if let Some(cached) = self
-            .id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .filter(|id| id.at.elapsed() < ID_TTL)
-        {
+        // Single-flight: мьютекс удерживается и на время discovery,
+        // иначе толпа параллельных запросов устроит 50 независимых извлечений.
+        let mut slot = self.id.lock().await;
+        if let Some(cached) = slot.as_ref().filter(|id| id.at.elapsed() < ID_TTL) {
             return Ok(cached.value.clone());
         }
-        let id = discover_id(&self.http).await?;
-        self.id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(CachedId {
-                value: id.clone(),
-                at: Instant::now(),
-            });
+        // Суммарный лимит извлечения: страница + до 8 бандлов под 9-секундными
+        // таймаутами клиента могли бы занять больше минуты без него.
+        let id = tokio::time::timeout(Duration::from_secs(15), discover_id(&self.http))
+            .await
+            .map_err(|_| SourceError::Unavailable)??;
+        slot.replace(CachedId {
+            value: id.clone(),
+            at: Instant::now(),
+        });
         Ok(id)
     }
 
-    fn forget_id(&self) {
-        self.id.lock().unwrap_or_else(|e| e.into_inner()).take();
+    async fn forget_id(&self) {
+        self.id.lock().await.take();
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, SourceError> {
@@ -163,7 +170,7 @@ impl SoundCloudClient {
             .await
             .map_err(|_| SourceError::Unavailable)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.fixed.is_none() {
-            self.forget_id();
+            self.forget_id().await;
             let id = self.client_id().await?;
             let retry = self
                 .http
@@ -174,7 +181,15 @@ impl SoundCloudClient {
                 .send()
                 .await
                 .map_err(|_| SourceError::Unavailable)?;
-            return bounded_json(retry).await;
+            if retry.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(SourceError::NotFound);
+            }
+            return bounded_json(
+                retry
+                    .error_for_status()
+                    .map_err(|_| SourceError::Unavailable)?,
+            )
+            .await;
         }
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(SourceError::NotFound);
@@ -204,13 +219,44 @@ impl SoundCloudClient {
         parse_search(&data)
     }
 
+    async fn remember_negative(&self, id: &str) {
+        let mut neg = self.neg.lock().await;
+        neg.retain(|_, at| at.elapsed() < NEG_TTL);
+        if neg.len() >= NEG_CAP
+            && let Some(oldest) = neg.iter().min_by_key(|(_, at)| *at).map(|(k, _)| k.clone())
+        {
+            neg.remove(&oldest);
+        }
+        neg.insert(id.into(), Instant::now());
+    }
+
+    async fn is_negative(&self, id: &str) -> bool {
+        self.neg
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|at| at.elapsed() < NEG_TTL)
+    }
+
     /// Разрешение трека в прямой поток. Принимает числовой ID.
     pub async fn resolve(&self, id: &str) -> Result<SourceStream, SourceError> {
+        if !valid_id(id) {
+            return Err(SourceError::Invalid);
+        }
+        if self.is_negative(id).await {
+            return Err(SourceError::NotFound);
+        }
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
         let data = self
             .get_json(&format!("{}/tracks/{track_id}", self.api))
             .await?;
-        self.stream_from_track(&data).await
+        match self.stream_from_track(&data).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                self.remember_negative(id).await;
+                Err(error)
+            }
+        }
     }
 
     /// Прямая ссылка вида soundcloud.com/артист/трек: сначала resolve в ID.
@@ -233,11 +279,24 @@ impl SoundCloudClient {
 
     /// Метаданные трека по числовому ID без получения потока.
     pub async fn track(&self, id: &str) -> Result<SourceTrack, SourceError> {
+        if !valid_id(id) {
+            return Err(SourceError::Invalid);
+        }
+        if self.is_negative(id).await {
+            return Err(SourceError::NotFound);
+        }
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
         let data = self
             .get_json(&format!("{}/tracks/{track_id}", self.api))
             .await?;
-        parse_track(&data).ok_or(SourceError::NotFound)
+        // Временные сетевые сбои не кэшируем — только итог «трека нет».
+        match parse_track(&data) {
+            Some(track) if track.playback != Playback::Blocked => Ok(track),
+            _ => {
+                self.remember_negative(id).await;
+                Err(SourceError::NotFound)
+            }
+        }
     }
 
     async fn stream_from_track(&self, data: &Value) -> Result<SourceStream, SourceError> {
@@ -436,15 +495,14 @@ fn parse_track(item: &Value) -> Option<SourceTrack> {
         .or_else(|| item["duration"].as_u64())
         .unwrap_or(0);
     let playback = match item["policy"].as_str().unwrap_or("ALLOW") {
-        "ALLOW" => {
-            if has_progressive(item) {
-                Playback::Full
-            } else if has_hls(item) {
-                Playback::HlsOnly
-            } else {
-                Playback::Full
-            }
-        }
+        "ALLOW" => match item.get("media").and_then(|m| m.get("transcodings")) {
+            // Без списка транскодингов считаем запись полной —
+            // окончательное слово за resolve (или его ошибкой).
+            None => Playback::Full,
+            Some(t) if has_protocol(t, "progressive") => Playback::Full,
+            Some(t) if has_protocol(t, "hls") => Playback::HlsOnly,
+            _ => Playback::Blocked,
+        },
         _ => Playback::Blocked,
     };
     Some(SourceTrack {
@@ -457,16 +515,10 @@ fn parse_track(item: &Value) -> Option<SourceTrack> {
     })
 }
 
-fn has_progressive(item: &Value) -> bool {
-    item["media"]["transcodings"]
+fn has_protocol(transcodings: &Value, protocol: &str) -> bool {
+    transcodings
         .as_array()
-        .is_some_and(|t| t.iter().any(|t| t["format"]["protocol"] == "progressive"))
-}
-
-fn has_hls(item: &Value) -> bool {
-    item["media"]["transcodings"]
-        .as_array()
-        .is_some_and(|t| t.iter().any(|t| t["format"]["protocol"] == "hls"))
+        .is_some_and(|t| t.iter().any(|t| t["format"]["protocol"] == protocol))
 }
 
 fn progressive_url(item: &Value, base: &str) -> Option<String> {
@@ -512,14 +564,28 @@ pub fn valid_stream_url(url: &str) -> bool {
 }
 
 fn valid_media_url(url: &str) -> bool {
-    url.len() <= 1024 && valid_stream_url(url)
+    url.len() <= 1024
+        && url::Url::parse(url).ok().is_some_and(|u| {
+            u.scheme() == "https"
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.port().is_none()
+                && u.fragment().is_none()
+                && u.host_str()
+                    .is_some_and(|h| h == "sndcdn.com" || h.ends_with(".sndcdn.com"))
+        })
+}
+
+/// Числовой ID SoundCloud: до 19 цифр, парсится в u64.
+/// Единая проверка для поиска, треков и прокси.
+pub fn valid_id(numeric: &str) -> bool {
+    !numeric.is_empty() && numeric.len() <= 19 && numeric.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Числовой ID трека. Полные ссылки обрабатывает `resolve_url`.
 pub fn track_id_from_link(link: &str) -> Option<String> {
     let link = link.trim();
-    (!link.is_empty() && link.len() <= 12 && link.bytes().all(|b| b.is_ascii_digit()))
-        .then_some(link.into())
+    valid_id(link).then_some(link.into())
 }
 
 /// Каноническая ссылка на трек для `/resolve`. Короткие ссылки
@@ -576,7 +642,17 @@ mod tests {
         ));
         assert!(!valid_stream_url("https://evil.test/x.mp3"));
         assert!(!valid_stream_url("http://cf-media.sndcdn.com/x.mp3"));
+        assert!(!valid_stream_url(
+            "https://user:pass@cf-media.sndcdn.com/x.mp3"
+        ));
+        assert!(valid_stream_url("http://127.0.0.1:8080/cdn/x.mp3"));
+        assert!(!valid_stream_url("http://127.0.0.1:8080.evil.test/x.mp3"));
         assert_eq!(track_id_from_link("123456789"), Some("123456789".into()));
+        assert_eq!(
+            track_id_from_link("1234567890123456789").as_deref(),
+            Some("1234567890123456789")
+        );
+        assert!(track_id_from_link("12345678901234567890").is_none());
         assert_eq!(
             canonical_track_link("https://soundcloud.com/artist/track-name?si=abc").as_deref(),
             Some("https://soundcloud.com/artist/track-name")
@@ -591,11 +667,13 @@ mod tests {
             r#"{"collection":[
 {"id":1,"title":"Free","user":{"username":"A"},"artwork_url":"https://i1.sndcdn.com/art.jpg","full_duration":200000,"policy":"ALLOW","media":{"transcodings":[{"url":"https://api-v2.soundcloud.com/media/x/stream/progressive","format":{"protocol":"progressive"}}]}},
 {"id":2,"title":"Go+","user":{"username":"B"},"policy":"ALLOW","media":{"transcodings":[{"url":"https://api-v2.soundcloud.com/media/y/stream/hls","format":{"protocol":"hls"}}]}},
-{"id":3,"title":"Blocked","user":{"username":"C"},"policy":"BLOCK","media":{}}]}"#,
+{"id":3,"title":"Blocked","user":{"username":"C"},"policy":"BLOCK","media":{}},
+{"id":4,"title":"Sparse","user":{"username":"D"},"policy":"ALLOW"},
+{"id":5,"title":"Empty","user":{"username":"E"},"policy":"ALLOW","media":{"transcodings":[]}}]}"#,
         )
         .unwrap();
         let tracks = parse_search(&data).unwrap();
-        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks.len(), 5);
         assert_eq!(tracks[0].playback, Playback::Full);
         assert_eq!(
             tracks[0].artwork.as_deref(),
@@ -603,6 +681,8 @@ mod tests {
         );
         assert_eq!(tracks[1].playback, Playback::HlsOnly);
         assert_eq!(tracks[2].playback, Playback::Blocked);
+        assert_eq!(tracks[3].playback, Playback::Full);
+        assert_eq!(tracks[4].playback, Playback::Blocked);
         assert!(progressive_url(&data["collection"][0], DEFAULT_API).is_some());
         assert!(progressive_url(&data["collection"][1], DEFAULT_API).is_none());
     }
@@ -618,6 +698,14 @@ mod tests {
         ));
         assert!(!check_api_url(
             "https://user@api-v2.soundcloud.com/media/x",
+            DEFAULT_API
+        ));
+        assert!(!check_api_url(
+            "https://api-v2.soundcloud.com/other/x",
+            DEFAULT_API
+        ));
+        assert!(!check_api_url(
+            "https://api-v2.soundcloud.com/media/x?client_id=y#frag",
             DEFAULT_API
         ));
         assert!(valid_stream_url("http://127.0.0.1:8080/cdn/x.mp3"));

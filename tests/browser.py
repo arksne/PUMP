@@ -49,6 +49,62 @@ def wait_for_audio(page, predicate):
     raise AssertionError(f"Плеер не перешёл в ожидаемое состояние: {predicate}, {state}")
 
 
+def soundcloud_stub(media, entries, client_id="a"*32):
+    """Локальный api-v2 + CDN: поиск, resolve и поток без внешней сети.
+    entries: [{"id": "424242", "title": ..., "artist": ...}].
+    Подсчёт обращений к resolve — через handler.calls."""
+    def track_json(entry, base):
+        return {"id":int(entry["id"]),"title":entry["title"],"user":{"username":entry["artist"]},
+                "duration":40000,"full_duration":40000,"policy":"ALLOW",
+                "media":{"transcodings":[{"url":base+f"/media/soundcloud:tracks:{entry['id']}/abc/stream/progressive",
+                                          "format":{"protocol":"progressive","mime_type":"audio/mpeg"}}]}}
+    class ScHandler(BaseHTTPRequestHandler):
+        calls=[]
+        def payload(handler,obj,status=200):
+            body=json.dumps(obj).encode()
+            handler.send_response(status)
+            handler.send_header("Content-Type","application/json")
+            handler.send_header("Content-Length",str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        def do_GET(handler):
+            base=f"http://127.0.0.1:{handler.server.server_port}"
+            by_id={e["id"]:e for e in entries}
+            if handler.path.startswith("/search?"):
+                assert "client_id="+client_id in handler.path
+                handler.payload({"collection":[track_json(by_id[i],base) for i in sorted(by_id)]})
+            elif handler.path.startswith("/tracks/"):
+                ident=handler.path.split("/tracks/")[1].split("?")[0]
+                if ident in by_id:
+                    handler.payload(track_json(by_id[ident],base))
+                else:
+                    handler.send_error(404)
+            elif "/stream/progressive" in handler.path:
+                assert "client_id="+client_id in handler.path
+                type(handler).calls.append(handler.path)
+                handler.payload({"url":base+"/cdn/track.mp3"})
+            elif handler.path.startswith("/cdn/track.mp3"):
+                start,end=0,len(media)-1
+                if value:=handler.headers.get("Range"):
+                    found=re.fullmatch(r"bytes=(\d+)-(\d*)",value)
+                    if not found:
+                        handler.send_error(416)
+                        return
+                    start=int(found[1]);end=min(int(found[2]) if found[2] else end,end)
+                handler.send_response(206 if handler.headers.get("Range") else 200)
+                handler.send_header("Content-Type","audio/mpeg")
+                handler.send_header("Content-Length",str(end-start+1))
+                if handler.headers.get("Range"):
+                    handler.send_header("Content-Range",f"bytes {start}-{end}/{len(media)}")
+                handler.end_headers()
+                handler.wfile.write(media[start:end+1])
+            else:
+                handler.send_error(404)
+        def log_message(self,*args):
+            pass
+    return ScHandler
+
+
 class PlayerTest(unittest.TestCase):
     def setUp(self):
         self.folder = TemporaryDirectory(prefix="pump-browser-")
@@ -144,71 +200,48 @@ class PlayerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as invalid:
             self.request("/source/sc/abc")
         self.assertEqual(invalid.exception.code, 404)
-        _, _, data = self.request("/api/search?source=soundcloud&q=North")
-        body = json.loads(data)
-        self.assertIsInstance(body["tracks"], list)
-        for track in body["tracks"]:
+        tracks = self.soundcloud_live_tracks("North")
+        for track in tracks:
             self.assertTrue(track["id"].startswith("sc-"))
             self.assertTrue(track["audio_url"].startswith("/source/sc/"))
             self.assertEqual((track["kind"], track["source"]), ("full", "SoundCloud"))
 
+    def soundcloud_live_tracks(self, query):
+        """Живой поиск SoundCloud: при недоступности сети — skip,
+        при пустом ответе без пометки о недоступности — провал (регрессия)."""
+        _, _, data = self.request(f"/api/search?source=soundcloud&q={query}")
+        body = json.loads(data)
+        tracks = [t for t in body["tracks"] if t["kind"] == "full"]
+        if not tracks and body.get("notice") and "недоступен" in body["notice"]:
+            self.skipTest("SoundCloud недоступен из этой сети")
+        return tracks
+
     def test_soundcloud_stub_chain_search_resolve_stream(self):
         media=(self.root/"music/alpha.mp3").read_bytes()
-        received=[]
-        track_id="424242"
-        client_id="a"*32
-        class ScHandler(BaseHTTPRequestHandler):
-            def payload(handler,obj,status=200):
-                body=json.dumps(obj).encode()
-                handler.send_response(status)
-                handler.send_header("Content-Type","application/json")
-                handler.send_header("Content-Length",str(len(body)))
-                handler.end_headers()
-                handler.wfile.write(body)
-            def do_GET(handler):
-                received.append(handler.path)
-                base=f"http://127.0.0.1:{handler.server.server_port}"
-                track={"id":424242,"title":"Stub Loop","user":{"username":"Stub Artist"},"duration":40000,"full_duration":40000,"policy":"ALLOW","media":{"transcodings":[{"url":base+"/media/soundcloud:tracks:424242/abc/stream/progressive","format":{"protocol":"progressive","mime_type":"audio/mpeg"}}]}}
-                if handler.path.startswith("/search?"):
-                    assert "client_id="+client_id in handler.path
-                    handler.payload({"collection":[track]})
-                elif handler.path.startswith(f"/tracks/{track_id}"):
-                    handler.payload(track)
-                elif "/stream/progressive" in handler.path:
-                    assert "client_id="+client_id in handler.path
-                    handler.payload({"url":base+"/cdn/track.mp3"})
-                elif handler.path.startswith("/cdn/track.mp3"):
-                    start,end=0,len(media)-1
-                    if value:=handler.headers.get("Range"):
-                        found=re.fullmatch(r"bytes=(\d+)-(\d*)",value)
-                        if not found:
-                            handler.send_error(416)
-                            return
-                        start=int(found[1]);end=min(int(found[2]) if found[2] else end,end)
-                    handler.send_response(206 if handler.headers.get("Range") else 200)
-                    handler.send_header("Content-Type","audio/mpeg")
-                    handler.send_header("Content-Length",str(end-start+1))
-                    if handler.headers.get("Range"):
-                        handler.send_header("Content-Range",f"bytes {start}-{end}/{len(media)}")
-                    handler.end_headers()
-                    handler.wfile.write(media[start:end+1])
-                else:
-                    handler.send_error(404)
-            def log_message(self,*args):
-                pass
+        entries=[{"id":"424242","title":"Stub Loop","artist":"Stub Artist"},
+                 {"id":"434343","title":"Second Stub","artist":"Stub Artist"}]
+        ScHandler=soundcloud_stub(media,entries)
         stub=ThreadingHTTPServer(("127.0.0.1",0),ScHandler)
         threading.Thread(target=stub.serve_forever,daemon=True).start()
         self.addCleanup(stub.server_close)
         self.addCleanup(stub.shutdown)
         self.stop()
-        self.environment.update(SOUNDCLOUD_CLIENT_ID=client_id,SOUNDCLOUD_API_BASE=f"http://127.0.0.1:{stub.server_port}")
+        self.environment.update(SOUNDCLOUD_CLIENT_ID="a"*32,SOUNDCLOUD_API_BASE=f"http://127.0.0.1:{stub.server_port}")
         self.start()
         _,_,data=self.request("/api/search?source=soundcloud&q=Stub")
-        [track]=json.loads(data)["tracks"]
-        self.assertEqual((track["id"],track["title"],track["source"]),(f"sc-{track_id}","Stub Loop","SoundCloud"))
-        self.assertEqual(track["audio_url"],f"/source/sc/{track_id}")
+        found={t["id"]:t for t in json.loads(data)["tracks"]}
+        self.assertEqual(set(found),{"sc-424242","sc-434343"})
+        track=found["sc-424242"]
+        self.assertEqual((track["title"],track["source"]),("Stub Loop","SoundCloud"))
+        self.assertEqual(track["audio_url"],"/source/sc/424242")
         status,headers,part=self.request(track["audio_url"],headers={"Range":"bytes=0-99"})
         self.assertEqual((status,part),(206,media[:100]))
+        self.assertTrue(headers["Content-Range"].startswith("bytes 0-99/"))
+        # Каждый запрос перерезолвит подпись заново: кэша подписанных URL нет.
+        before=len(ScHandler.calls)
+        status,_,again=self.request(track["audio_url"],headers={"Range":"bytes=100-199"})
+        self.assertEqual((status,again),(206,media[100:200]))
+        self.assertGreater(len(ScHandler.calls),before)
         _,_,meta=self.request("/api/tracks/"+track["id"])
         self.assertEqual(json.loads(meta)["title"],"Stub Loop")
         with sync_playwright() as driver:
@@ -225,6 +258,59 @@ class PlayerTest(unittest.TestCase):
             page.get_by_role("button",name="Stub Loop",exact=False).click()
             expect(page.locator("#tTitle")).to_have_text("Stub Loop")
             wait_for_audio(page,"audio => !audio.paused && audio.currentTime > 0.5")
+            # Перемотка внутри проксированного потока.
+            page.locator("#seekBar").evaluate("(bar) => { bar.value = 50; bar.dispatchEvent(new Event('input', {bubbles: true})); }")
+            wait_for_audio(page,"audio => audio.currentTime >= 19.5")
+            # Смена трека: второй результат играет с начала.
+            page.locator("#tabSearch").click()
+            page.get_by_role("button",name="Second Stub",exact=False).click()
+            expect(page.locator("#tTitle")).to_have_text("Second Stub")
+            wait_for_audio(page,"audio => !audio.paused && audio.currentTime < 5 && audio.currentTime > 0.2")
+            self.assertEqual(errors,[])
+            browser.close()
+
+    def test_soundcloud_stub_room_follows_host(self):
+        media=(self.root/"music/alpha.mp3").read_bytes()
+        entries=[{"id":"424242","title":"Stub Loop","artist":"Stub Artist"}]
+        ScHandler=soundcloud_stub(media,entries)
+        stub=ThreadingHTTPServer(("127.0.0.1",0),ScHandler)
+        threading.Thread(target=stub.serve_forever,daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        self.stop()
+        self.environment.update(SOUNDCLOUD_CLIENT_ID="a"*32,SOUNDCLOUD_API_BASE=f"http://127.0.0.1:{stub.server_port}")
+        self.start()
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            device=driver.devices["Pixel 7"]
+            host=browser.new_context(**device).new_page()
+            guest=browser.new_context(**device).new_page()
+            errors=[]
+            for page in (host,guest):
+                page.on("pageerror",lambda error:errors.append(str(error)))
+                page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+                page.goto(self.origin)
+            host.locator("#tabSearch").click()
+            host.locator("#source").select_option("soundcloud")
+            host.locator("#qInput").fill("Stub")
+            host.get_by_role("button",name="Stub Loop",exact=False).click()
+            expect(host.locator("#tTitle")).to_have_text("Stub Loop")
+            wait_for_audio(host,"audio => !audio.paused && audio.currentTime > 0.5")
+            host.locator("#tabRooms").click()
+            host.locator("#createRoom").click()
+            expect(host.locator("#roomStatus")).to_contain_text("Ведущий")
+            code=host.locator("#roomCode").input_value()
+            guest.locator("#tabRooms").click()
+            guest.locator("#roomCode").fill(code)
+            guest.get_by_role("button",name="Войти",exact=True).click()
+            expect(guest.locator("#roomStatus")).to_contain_text("Слушатель")
+            guest.locator("#enableRoomSound").click()
+            expect(guest.locator("#tTitle")).to_have_text("Stub Loop")
+            wait_for_audio(guest,"audio => !audio.paused && audio.currentTime > 0.3")
+            host_position=host.locator("#audio").evaluate("(audio) => audio.currentTime")
+            guest_position=guest.locator("#audio").evaluate("(audio) => audio.currentTime")
+            self.assertLess(abs(host_position-guest_position),1.0)
             self.assertEqual(errors,[])
             browser.close()
 
@@ -419,7 +505,7 @@ class PlayerTest(unittest.TestCase):
             page.get_by_role("button", name="North Loop", exact=False).click()
             wait_for_audio(page, "audio => audio.currentTime > 0.6")
             page.locator("#tabLyrics").click()
-            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 2.5; }")
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 2.1; }")
             expect(page.locator(".lyric-word.current")).to_have_text("two", timeout=8000)
             page.locator("#audio").evaluate("(audio) => audio.pause()")
             page.wait_for_timeout(1200)
@@ -493,10 +579,7 @@ class PlayerTest(unittest.TestCase):
             browser.close()
 
     def test_soundcloud_playback_range_seek_and_refresh(self):
-        _, _, data = self.request("/api/search?source=soundcloud&q=lofi")
-        tracks = [t for t in json.loads(data)["tracks"] if t["kind"] == "full"]
-        if not tracks:
-            self.skipTest("SoundCloud недоступен из этой сети")
+        tracks = self.soundcloud_live_tracks("lofi")
         track = tracks[0]
         self.assertTrue(track["audio_url"].startswith("/source/sc/"))
         status, headers, data = self.request(track["audio_url"])
@@ -516,10 +599,8 @@ class PlayerTest(unittest.TestCase):
         self.assertEqual(json.loads(meta)["id"], track["id"])
 
     def test_room_follows_soundcloud_track(self):
-        _, _, data = self.request("/api/search?source=soundcloud&q=lofi")
-        tracks = [t for t in json.loads(data)["tracks"] if t["kind"] == "full"]
-        if not tracks:
-            self.skipTest("SoundCloud недоступен из этой сети")
+        tracks = self.soundcloud_live_tracks("lofi")
+        assert tracks, "see soundcloud_live_tracks"
         with sync_playwright() as driver:
             executable = os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
             browser = driver.chromium.launch(executable_path=executable)
@@ -553,7 +634,8 @@ class PlayerTest(unittest.TestCase):
             browser.close()
 
     def test_lyrics_sync_seek_rate_pause(self):
-        lrc = "[00:01.00] One" + chr(10) + "[00:03.00] Two" + chr(10) + "[00:05.00] Three" + chr(10)
+        lrc = ("[00:01.00] One" + chr(10) + "[00:03.00] Two" + chr(10)
+               + "[00:05.00] Three" + chr(10) + "[00:07.00] Four" + chr(10))
         with sync_playwright() as driver:
             executable = os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
             browser = driver.chromium.launch(executable_path=executable)
@@ -571,16 +653,21 @@ class PlayerTest(unittest.TestCase):
             # Перемотка ставит активную строку по времени.
             page.locator("#audio").evaluate("(audio) => { audio.currentTime = 4.2; }")
             expect(page.locator(".l-line.active")).to_have_text("Two", timeout=8000)
-            # Скорость не ломает привязку: через ~2 с активна третья строка.
-            page.locator("#audio").evaluate("(audio) => { audio.playbackRate = 1.15; }")
-            expect(page.locator(".l-line.active")).to_have_text("Three", timeout=8000)
-            # Пауза фиксирует строку, продолжение — возобновляет без скачка.
-            page.locator("#audio").evaluate("(audio) => audio.pause()")
-            page.wait_for_timeout(1200)
+            # Медленная скорость видна: за 1.5 с строка не успевает смениться
+            # (на 1.0x "Four" появилась бы через 0.8 c).
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 6.4; audio.playbackRate = 0.5; }")
+            page.wait_for_timeout(1500)
             self.assertEqual(page.locator(".l-line.active").inner_text(), "Three")
+            expect(page.locator(".l-line.active")).to_have_text("Four", timeout=8000)
+            # Пауза в середине строки фиксирует её; продолжение — без скачка.
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime = 4.2; }")
+            expect(page.locator(".l-line.active")).to_have_text("Two", timeout=8000)
+            page.locator("#audio").evaluate("(audio) => audio.pause()")
+            page.wait_for_timeout(1500)
+            self.assertEqual(page.locator(".l-line.active").inner_text(), "Two")
             page.locator("#audio").evaluate("(audio) => audio.play()")
             wait_for_audio(page, "audio => !audio.paused")
-            self.assertEqual(page.locator(".l-line.active").inner_text(), "Three")
+            self.assertEqual(page.locator(".l-line.active").inner_text(), "Two")
             self.assertEqual(errors, [])
             browser.close()
 

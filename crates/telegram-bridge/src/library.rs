@@ -101,7 +101,19 @@ pub(crate) async fn download(
     let cover_url = track
         .artwork
         .as_deref()
-        .and_then(|url| app.library.base.join(url).ok());
+        .and_then(|url| app.library.base.join(url).ok())
+        .filter(|url| {
+            // Обложку тянет сервер: только свой origin или известные CDN.
+            // Произвольный URL провайдера сюда не проходит.
+            url.origin() == app.library.base.origin()
+                || (url.scheme() == "https"
+                    && url.host_str().is_some_and(|h| {
+                        h.ends_with(".sndcdn.com")
+                            || h.ends_with(".mzstatic.com")
+                            || h.ends_with(".itunes.apple.com")
+                            || h == "i.ytimg.com"
+                    }))
+        });
     let manager = app.library.user(&owner).await?;
     manager
         .enqueue(DownloadRequest {

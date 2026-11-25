@@ -58,6 +58,7 @@ impl Store {
               PRIMARY KEY(owner,event)
             );
             CREATE INDEX IF NOT EXISTS listens_period ON listens(owner, timestamp);
+            CREATE INDEX IF NOT EXISTS listens_ts ON listens(timestamp);
         ",
         )
         .execute(&pool)
