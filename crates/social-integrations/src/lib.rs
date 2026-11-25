@@ -11,6 +11,7 @@ pub mod lastfm;
 pub mod model;
 pub mod queue;
 pub mod spotify;
+pub mod spotify_app;
 
 pub use error::{Error, Result};
 pub use model::{ImportItem, TrackMetadata};
