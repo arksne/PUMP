@@ -684,10 +684,14 @@ impl Catalog {
     }
 }
 
-fn apple_asset(raw: &str) -> Option<String> {
+/// Принимаются только адреса iTunes-cети; используется и как allowlist
+/// для исходящих запросов, построенных из метаданных каталога.
+pub fn apple_asset(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
     let host = url.host_str()?;
     if url.scheme() == "https"
+        && url.port().is_none()
+        && url.fragment().is_none()
         && (host.ends_with(".mzstatic.com") || host.ends_with(".itunes.apple.com"))
         && url.username().is_empty()
         && url.password().is_none()

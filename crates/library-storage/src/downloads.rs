@@ -6,6 +6,7 @@ use crate::{
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -173,7 +174,13 @@ impl DownloadManager {
         path: &Path,
         cancel: &CancellationToken,
     ) -> Result<LibraryTrack> {
-        let mut response = tokio::select! {r=self.client.get(request.url.clone()).send()=>r?.error_for_status()?,_=cancel.cancelled()=>return Err(Error::Cancelled)};
+        // Заголовки — за 30 с, каждый чанк тела — за 30 с простоя.
+        let mut response = tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(30), self.client.get(request.url.clone()).send()) => {
+                r.map_err(|_| Error::Limit("время ожидания загрузки".into()))??.error_for_status()?
+            }
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+        };
         let total = response.content_length();
         if total.is_some_and(|n| n > self.config.max_bytes) {
             return Err(Error::Limit("аудиофайл".into()));
@@ -185,7 +192,12 @@ impl DownloadManager {
             .await?;
         let mut count = 0;
         loop {
-            let chunk = tokio::select! {r=response.chunk()=>r?,_=cancel.cancelled()=>return Err(Error::Cancelled)};
+            let chunk: Option<_> = tokio::select! {
+                r = tokio::time::timeout(Duration::from_secs(30), response.chunk()) => {
+                    r.map_err(|_| Error::Limit("время ожидания загрузки".into()))??
+                }
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+            };
             let Some(chunk) = chunk else {
                 break;
             };
@@ -209,12 +221,11 @@ impl DownloadManager {
         let mut cover = None;
         let mut cover_bytes = None;
         if let Some(url) = &request.cover_url {
-            let mut response = self
-                .client
-                .get(url.clone())
-                .send()
-                .await?
-                .error_for_status()?;
+            let mut response =
+                tokio::time::timeout(Duration::from_secs(30), self.client.get(url.clone()).send())
+                    .await
+                    .map_err(|_| Error::Limit("время ожидания обложки".into()))??
+                    .error_for_status()?;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await? {
                 if bytes.len() + chunk.len() > 8 * 1024 * 1024 {

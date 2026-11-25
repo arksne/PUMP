@@ -20,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 
-const API: &str = "https://api-v2.soundcloud.com";
+const DEFAULT_API: &str = "https://api-v2.soundcloud.com";
 const HOME: &str = "https://soundcloud.com/";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const ID_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -95,6 +95,7 @@ struct CachedId {
 pub struct SoundCloudClient {
     http: reqwest::Client,
     fixed: Option<String>,
+    api: String,
     id: Mutex<Option<CachedId>>,
 }
 
@@ -103,6 +104,7 @@ impl SoundCloudClient {
         Self {
             http,
             fixed: None,
+            api: api_base(),
             id: Mutex::default(),
         }
     }
@@ -116,6 +118,7 @@ impl SoundCloudClient {
         Self {
             http,
             fixed,
+            api: api_base(),
             id: Mutex::default(),
         }
     }
@@ -193,7 +196,8 @@ impl SoundCloudClient {
         let limit = limit.clamp(1, 16);
         let data = self
             .get_json(&format!(
-                "{API}/search?q={}&kind=track&limit={limit}",
+                "{}/search?q={}&kind=track&limit={limit}",
+                self.api,
                 urlencoding(query)
             ))
             .await?;
@@ -203,7 +207,9 @@ impl SoundCloudClient {
     /// Разрешение трека в прямой поток. Принимает числовой ID.
     pub async fn resolve(&self, id: &str) -> Result<SourceStream, SourceError> {
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
-        let data = self.get_json(&format!("{API}/tracks/{track_id}")).await?;
+        let data = self
+            .get_json(&format!("{}/tracks/{track_id}", self.api))
+            .await?;
         self.stream_from_track(&data).await
     }
 
@@ -215,7 +221,7 @@ impl SoundCloudClient {
     ) -> Result<(SourceTrack, SourceStream), SourceError> {
         let link = canonical_track_link(link).ok_or(SourceError::Invalid)?;
         let data = self
-            .get_json(&format!("{API}/resolve?url={}", urlencoding(&link)))
+            .get_json(&format!("{}/resolve?url={}", self.api, urlencoding(&link)))
             .await?;
         if data["kind"] != "track" {
             return Err(SourceError::NotFound);
@@ -228,7 +234,9 @@ impl SoundCloudClient {
     /// Метаданные трека по числовому ID без получения потока.
     pub async fn track(&self, id: &str) -> Result<SourceTrack, SourceError> {
         let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
-        let data = self.get_json(&format!("{API}/tracks/{track_id}")).await?;
+        let data = self
+            .get_json(&format!("{}/tracks/{track_id}", self.api))
+            .await?;
         parse_track(&data).ok_or(SourceError::NotFound)
     }
 
@@ -237,9 +245,9 @@ impl SoundCloudClient {
         if track.playback == Playback::Blocked {
             return Err(SourceError::NoStream);
         }
-        let endpoint = progressive_url(data).ok_or(SourceError::NoStream)?;
+        let endpoint = progressive_url(data, &self.api).ok_or(SourceError::NoStream)?;
         let id = self.client_id().await?;
-        let data: Value = self
+        let response = self
             .http
             .get(&endpoint)
             .query(&[("client_id", id.as_str())])
@@ -249,10 +257,17 @@ impl SoundCloudClient {
             .await
             .map_err(|_| SourceError::Unavailable)?
             .error_for_status()
-            .map_err(|_| SourceError::Unavailable)?
-            .json()
-            .await
             .map_err(|_| SourceError::Unavailable)?;
+        // Ответ resolve короткий; большой ответ отклоняется до парсинга.
+        let mut bytes = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|_| SourceError::NoStream)? {
+            if bytes.len() + chunk.len() > 65536 {
+                return Err(SourceError::NoStream);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| SourceError::NoStream)?;
         let url = data["url"].as_str().ok_or(SourceError::NoStream)?;
         if !valid_stream_url(url) {
             return Err(SourceError::NoStream);
@@ -263,6 +278,39 @@ impl SoundCloudClient {
             mime_type: "audio/mpeg".into(),
         })
     }
+}
+
+/// База api-v2 с явной точкой переопределения для тестов и зеркал.
+/// `SOUNDCLOUD_API_BASE` принимает только https либо http на loopback;
+/// невалидное значение тихо заменяется адресом по умолчанию.
+fn api_base() -> String {
+    let raw = std::env::var("SOUNDCLOUD_API_BASE").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return DEFAULT_API.into();
+    }
+    let parsed = url::Url::parse(raw).ok().filter(|u| {
+        u.username().is_empty()
+            && u.password().is_none()
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && matches!(u.path(), "" | "/")
+            && (u.scheme() == "https" || (u.scheme() == "http" && is_loopback(u)))
+    });
+    match parsed {
+        Some(u) => u.to_string().trim_end_matches('/').to_owned(),
+        None => {
+            tracing::warn!("Некорректный SOUNDCLOUD_API_BASE, используется адрес по умолчанию");
+            DEFAULT_API.into()
+        }
+    }
+}
+
+fn is_loopback(u: &url::Url) -> bool {
+    matches!(
+        u.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
 }
 
 fn valid_client_id(value: &str) -> Option<String> {
@@ -421,31 +469,45 @@ fn has_hls(item: &Value) -> bool {
         .is_some_and(|t| t.iter().any(|t| t["format"]["protocol"] == "hls"))
 }
 
-fn progressive_url(item: &Value) -> Option<String> {
+fn progressive_url(item: &Value, base: &str) -> Option<String> {
     item["media"]["transcodings"]
         .as_array()?
         .iter()
         .find_map(|t| {
             let url = t["url"].as_str()?;
-            (t["format"]["protocol"] == "progressive" && valid_api_url(url))
+            (t["format"]["protocol"] == "progressive" && check_api_url(url, base))
                 .then_some(url.to_owned())
         })
 }
 
-fn valid_api_url(url: &str) -> bool {
-    url::Url::parse(url).ok().is_some_and(|u| {
-        u.scheme() == "https"
-            && u.host_str() == Some("api-v2.soundcloud.com")
-            && u.path().starts_with("/media/")
-    })
+fn check_api_url(url: &str, base: &str) -> bool {
+    let Ok(endpoint) = url::Url::parse(url) else {
+        return false;
+    };
+    let Ok(origin) = url::Url::parse(base) else {
+        return false;
+    };
+    endpoint.scheme() == origin.scheme()
+        && endpoint.host_str() == origin.host_str()
+        && endpoint.port_or_known_default() == origin.port_or_known_default()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+        && endpoint.path().starts_with("/media/")
 }
 
-/// Подписанные CDN-ссылки живут только на хостах SoundCloud.
+/// Подписанные CDN-ссылки живут только на хостах SoundCloud
+/// (http разрешён лишь на loopback — для локальных стендов).
 pub fn valid_stream_url(url: &str) -> bool {
     url::Url::parse(url).ok().is_some_and(|u| {
-        u.scheme() == "https"
-            && u.host_str()
-                .is_some_and(|h| h == "sndcdn.com" || h.ends_with(".sndcdn.com"))
+        u.username().is_empty()
+            && u.password().is_none()
+            && ((u.scheme() == "https"
+                && u.port().is_none()
+                && u.host_str()
+                    .is_some_and(|h| h == "sndcdn.com" || h.ends_with(".sndcdn.com")))
+                || (u.scheme() == "http" && is_loopback(&u)))
     })
 }
 
@@ -541,7 +603,25 @@ mod tests {
         );
         assert_eq!(tracks[1].playback, Playback::HlsOnly);
         assert_eq!(tracks[2].playback, Playback::Blocked);
-        assert!(progressive_url(&data["collection"][0]).is_some());
-        assert!(progressive_url(&data["collection"][1]).is_none());
+        assert!(progressive_url(&data["collection"][0], DEFAULT_API).is_some());
+        assert!(progressive_url(&data["collection"][1], DEFAULT_API).is_none());
+    }
+    #[test]
+    fn api_base_and_hosts_are_constrained() {
+        assert!(check_api_url(
+            "https://api-v2.soundcloud.com/media/x/stream/progressive",
+            DEFAULT_API
+        ));
+        assert!(!check_api_url(
+            "https://api-v2.soundcloud.com:8443/media/x",
+            DEFAULT_API
+        ));
+        assert!(!check_api_url(
+            "https://user@api-v2.soundcloud.com/media/x",
+            DEFAULT_API
+        ));
+        assert!(valid_stream_url("http://127.0.0.1:8080/cdn/x.mp3"));
+        assert!(!valid_stream_url("http://evil.test/x.mp3"));
+        assert!(!valid_stream_url("https://127.0.0.1/x.mp3"));
     }
 }

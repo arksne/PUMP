@@ -73,6 +73,13 @@ pub(crate) async fn download(
         .base
         .join(&audio)
         .map_err(|_| ApiError::invalid("Некорректный источник."))?;
+    // Скачивание идёт только с нашего origin или из allowlist iTunes:
+    // произвольный абсолютный URL из метаданных сюда не проходит.
+    if url.origin() != app.library.base.origin()
+        && core_streaming::apple_asset(url.as_str()).is_none()
+    {
+        return Err(ApiError::invalid("Некорректный источник."));
+    }
     let extension = if id.starts_with("mp3-") || id.starts_with("soundhelix-") {
         "mp3"
     } else if audio.contains(".m4a") {

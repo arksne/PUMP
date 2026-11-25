@@ -1,5 +1,6 @@
 //! Потоковый WebDAV-клиент с ограничением путей настроенным корнем сервера.
 use crate::{Error, NetworkMode, Result};
+use std::time::Duration;
 use url::Url;
 #[derive(Clone)]
 pub struct WebDav {
@@ -51,6 +52,10 @@ impl WebDav {
         if let Some(range) = range {
             req = req.header("Range", range);
         }
-        Ok(req.send().await?.error_for_status()?)
+        // Ответные заголовки должны прийти за 30 с; тело идёт потоком дальше.
+        let sent = tokio::time::timeout(Duration::from_secs(30), req.send())
+            .await
+            .map_err(|_| Error::Limit("время ожидания NAS".into()))?;
+        Ok(sent?.error_for_status()?)
     }
 }
