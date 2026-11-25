@@ -197,8 +197,8 @@ where
             }
             Ok(None) => None,
             Ok(Some(item)) => {
-                let item = item
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+                let item =
+                    item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
                 let failed = item.is_err();
                 Some((item, (stream, done || failed)))
             }
