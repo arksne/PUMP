@@ -4,6 +4,7 @@
 mod error;
 pub mod innertube;
 pub mod network;
+pub mod soundcloud;
 pub use error::ApiError;
 pub const MAX_TRACK_MS: u64 = 24 * 60 * 60 * 1000;
 use anyhow::{Context, Result};
