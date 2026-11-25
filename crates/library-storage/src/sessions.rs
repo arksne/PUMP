@@ -62,6 +62,14 @@ impl Store {
         )
         .execute(&pool)
         .await?;
+        // Статистика читается только за 7/30 дней: события старше 35 дней
+        // удаляются при каждом открытии, база не растёт бесконечно.
+        // Сессии при этом не трогаются — токены остаются действительными.
+        let cutoff = now_ms().saturating_sub(35 * DAY_MS) as i64;
+        sqlx::query("DELETE FROM listens WHERE timestamp < ?")
+            .bind(cutoff)
+            .execute(&pool)
+            .await?;
         Ok(Self(pool))
     }
 
@@ -155,4 +163,38 @@ pub struct Rank {
     pub title: String,
     pub artist: String,
     pub milliseconds: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn retention_keeps_month_and_drops_old_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pump.sqlite");
+        let store = Store::open(&path).await.unwrap();
+        let old = now_ms().saturating_sub(40 * DAY_MS) as i64;
+        sqlx::query(
+            "INSERT INTO listens(owner,event,track,title,artist,timestamp,milliseconds) VALUES(?,?,?,?,?,?,?)",
+        )
+        .bind("guest:x")
+        .bind("old-event")
+        .bind("t")
+        .bind("T")
+        .bind("A")
+        .bind(old)
+        .bind(1000)
+        .execute(&store.0)
+        .await
+        .unwrap();
+        store
+            .record("guest:x", "new-event", "t", "T", "A", 2000)
+            .await
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        let summary = store.read("guest:x", Period::Month).await.unwrap();
+        assert_eq!(summary.milliseconds, 2000);
+        assert_eq!(summary.tracks, 1);
+    }
 }
