@@ -158,6 +158,7 @@ class PlayerTest(unittest.TestCase):
         auth={"Authorization":"Bearer "+token}
         with sqlite3.connect(self.root/"data/pump.sqlite") as db:
             owner=db.execute("SELECT owner FROM sessions WHERE token_hash=?",(hashlib.sha256(token.encode()).hexdigest(),)).fetchone()[0]
+        db.close()  # with закрывает только транзакцию: открытый дескриптор блокирует rmtree на Windows.
         media=(self.root/"music/alpha.mp3").read_bytes()
         received=[]
         class WebDavHandler(BaseHTTPRequestHandler):
