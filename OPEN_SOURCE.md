@@ -21,3 +21,20 @@ PUMP использует Rust-крейты как зависимости. Их 
 [Exportify](https://github.com/watsonbox/exportify), MIT, предоставляет пользователю экспорт плейлистов в CSV. PUMP умеет читать этот формат самостоятельно. Exportify работает как отдельный сайт, его код в PUMP не включён.
 
 DejaVu для PNG-карточек распространяется с [исходной лицензией](crates/telegram-bridge/assets/DejaVu-LICENSE.txt). Демозаписи SoundHelix отмечены в интерфейсе и README. Исходный HTML-дизайн предоставлен пользователем.
+
+## GATE 2 — ориентиры музыкального анализа (изучено 26.11.2026, код не копировался)
+
+Поставка PUMP считается закрытой: GPL/AGPL-код в репозиторий не входит, заимствуются только опубликованные формулы и алгоритмические идеи. Реализация `crates/audio-dsp-engine/src/music_analysis.rs` написана с нуля.
+
+| Проект | Версия / ревизия | Что взято за ориентир | Лицензия |
+| --- | --- | --- | --- |
+| [Mixxx](https://github.com/mixxxdj/mixxx) | ветка 2.4–2.5 | Темп автокорреляцией onset-огибающей, фазовый beatgrid, октавная неоднозначность | GPL-2.0-or-later |
+| [Essentia](https://github.com/MTG/essentia) | 2.1 | HPCP (пики спектра + парабола), RhythmExtractor, ключ по профилям Krumhansl–Schmuckler, гейты громкости EBU R128 | AGPL-3.0 |
+| [aubio](https://github.com/aubio/aubio) | 0.4.9 | Spectral flux с логарифмическим сжатием, пикирование onset, конвенция метки onset концом кадра | GPL-3.0 |
+| [librosa](https://github.com/librosa/librosa) | 0.10 | Chroma-нормализация и лог-компрессия, структурная самоподобность (рекуррентность) | ISC |
+| [realfft](https://github.com/HEnquist/realfft) | 3.5.1 (в Cargo.lock) | Прямая зависимость `analysis`: вещественное FFT поверх rustfft, переиспользование плана/буферов | MIT |
+| [rustfft](https://github.com/ejmahler/RustFFT) | 6.4.1 (в Cargo.lock) | Транзитивно через realfft | MIT OR Apache-2.0 |
+| [libebur128](https://github.com/jiixyj/libebur128) | 1.2.x | Двухступенчатые гейты −70 LU / −10 LU, тарсет K-взвешивания (свой `LoudnessMeter` уже следовал BS.1770) | MIT |
+| [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) | 1.x | Только референс фазовой обработки для будущего timestretch-EVAL Automix; в анализе не используется | MIT |
+
+Профили Krumhansl–Schmuckler — эмпирические константы из литературы (Krumhansl–Kessler), не код.

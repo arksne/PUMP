@@ -9,11 +9,13 @@ description = "Headless stereo DSP, analysis and playback primitives for PUMP"
 default = ["decode", "time-stretch"]
 decode = ["dep:symphonia"]
 time-stretch = ["dep:rubato"]
+analysis = ["dep:realfft"]
 native-output = ["dep:rodio", "decode"]
 dlna = ["dep:tokio", "dep:reqwest", "dep:roxmltree", "dep:url"]
 
 [dependencies]
 thiserror = "2"
+realfft = { version = "3", optional = true }
 tokio = { version = "1", features = ["net", "time"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 roxmltree = { version = "0.20", optional = true }

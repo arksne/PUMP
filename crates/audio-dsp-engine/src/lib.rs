@@ -7,6 +7,8 @@ pub mod analysis;
 pub mod decode;
 pub mod eq;
 pub mod mix;
+#[cfg(feature = "analysis")]
+pub mod music_analysis;
 #[cfg(all(feature = "native-output", not(target_arch = "wasm32")))]
 pub mod native;
 pub mod queue;
@@ -26,6 +28,8 @@ pub enum Error {
     AutoEq { line: usize, message: String },
     #[error("audio backend: {0}")]
     Backend(String),
+    #[error("analysis cancelled")]
+    Cancelled,
 }
 
 pub(crate) fn range(value: f64, min: f64, max: f64, name: &'static str) -> Result<()> {
