@@ -16,6 +16,8 @@ PUMP использует Rust-крейты как зависимости. Их 
 
 Для импорта Spotify без собственного Client ID изучен [SpotifyScraper](https://github.com/AliAkhtari78/SpotifyScraper), MIT. Использован подход чтения публичного Spotify Embed. Парсер PUMP написан на Rust, Python-проект не является зависимостью.
 
+Протокол SoundCloud (поиск, разрешение транскодингов, извлечение `client_id`) повторяет поведение веб-плеера и задокументирован в открытом каталоге [soundcloud-protocol](https://github.com/KlugesBuch1/soundcloud-protocol) (MIT) и документации [Resona API](https://savo-o.github.io/resona/api.html). Реализация PUMP написана самостоятельно поверх reqwest с учётом прокси и лимитов сервера; внешние Rust-крейты для SoundCloud не используются.
+
 [Exportify](https://github.com/watsonbox/exportify), MIT, предоставляет пользователю экспорт плейлистов в CSV. PUMP умеет читать этот формат самостоятельно. Exportify работает как отдельный сайт, его код в PUMP не включён.
 
 DejaVu для PNG-карточек распространяется с [исходной лицензией](crates/telegram-bridge/assets/DejaVu-LICENSE.txt). Демозаписи SoundHelix отмечены в интерфейсе и README. Исходный HTML-дизайн предоставлен пользователем.
