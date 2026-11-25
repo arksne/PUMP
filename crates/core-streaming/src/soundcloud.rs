@@ -208,7 +208,11 @@ impl SoundCloudClient {
     }
 
     /// Прямая ссылка вида soundcloud.com/артист/трек: сначала resolve в ID.
-    pub async fn resolve_url(&self, link: &str) -> Result<(String, SourceStream), SourceError> {
+    /// Возвращает метаданные и свежий поток.
+    pub async fn resolve_url(
+        &self,
+        link: &str,
+    ) -> Result<(SourceTrack, SourceStream), SourceError> {
         let link = canonical_track_link(link).ok_or(SourceError::Invalid)?;
         let data = self
             .get_json(&format!("{API}/resolve?url={}", urlencoding(&link)))
@@ -216,12 +220,16 @@ impl SoundCloudClient {
         if data["kind"] != "track" {
             return Err(SourceError::NotFound);
         }
-        let id = data["id"]
-            .as_u64()
-            .ok_or(SourceError::NotFound)?
-            .to_string();
+        let track = parse_track(&data).ok_or(SourceError::NotFound)?;
         let stream = self.stream_from_track(&data).await?;
-        Ok((id, stream))
+        Ok((track, stream))
+    }
+
+    /// Метаданные трека по числовому ID без получения потока.
+    pub async fn track(&self, id: &str) -> Result<SourceTrack, SourceError> {
+        let track_id: u64 = id.parse().map_err(|_| SourceError::Invalid)?;
+        let data = self.get_json(&format!("{API}/tracks/{track_id}")).await?;
+        parse_track(&data).ok_or(SourceError::NotFound)
     }
 
     async fn stream_from_track(&self, data: &Value) -> Result<SourceStream, SourceError> {

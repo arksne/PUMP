@@ -25,6 +25,7 @@ use axum::{
 };
 use catalog::{Catalog, SearchQuery};
 use serde_json::json;
+use social_integrations::spotify_app::SpotifyAppClient;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use url::Url;
@@ -34,11 +35,13 @@ pub(crate) const MAX_TRACK_MS: u64 = 24 * 60 * 60 * 1000;
 #[derive(Clone)]
 pub(crate) struct App {
     catalog: Arc<Catalog>,
+    http: reqwest::Client,
     stats: stats::Store,
     rooms: rooms::Rooms,
     controls: controls::Controls,
     telegram: Option<Arc<telegram::Settings>>,
     lyrics: lyrics_engine::LyricsClient,
+    spotify_app: Option<std::sync::Arc<SpotifyAppClient>>,
     library: library::Libraries,
     nas: nas_api::NetworkStorage,
     plugins: Arc<plugin_spine::PluginRegistry>,
@@ -125,8 +128,10 @@ pub async fn run() -> Result<()> {
         setting("PUMP_PLUGIN_DIR").map(PathBuf::from),
     )?);
     let nas = nas_api::NetworkStorage::load(setting("PUMP_NAS_CONFIG").map(PathBuf::from))?;
+    let spotify_app = SpotifyAppClient::from_env(http.clone()).map(std::sync::Arc::new);
     let app = App {
         nas,
+        http: http.clone(),
         plugins,
         plugin_media: plugin_media::PluginMedia::default(),
         imports: imports::Imports::default(),
@@ -137,6 +142,7 @@ pub async fn run() -> Result<()> {
         controls: controls::Controls::default(),
         telegram,
         lyrics: lyrics_engine::LyricsClient::new(http),
+        spotify_app,
         library: library::Libraries::new(
             data.join("downloads"),
             url::Url::parse(
@@ -250,6 +256,7 @@ fn router(app: App) -> Router {
             }),
         )
         .route("/api/search", get(search))
+        .route("/source/sc/{id}", get(source_sc))
         .route("/api/nas", get(nas_api::list))
         .route("/api/nas/{id}/ticket", post(nas_api::ticket))
         .route("/nas/stream/{token}", get(nas_api::stream))
@@ -322,8 +329,132 @@ async fn search(
     State(app): State<App>,
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let result = app.catalog.search(query).await?;
+    if matches!(query.source, catalog::Source::Spotify) {
+        return Ok(Json(spotify_search(&app, &query.q).await));
+    }
+    if !matches!(query.source, catalog::Source::All) || query.q.trim().is_empty() {
+        let result = app.catalog.search(query).await?;
+        return Ok(Json(result));
+    }
+    // Общий поиск: локальный каталог, превью, YouTube и SoundCloud идут
+    // параллельно с пределом времени; Spotify добавляется совпадающим.
+    let term = query.q.clone();
+    let (base, sc) = tokio::join!(
+        app.catalog.search(SearchQuery {
+            q: term.clone(),
+            source: catalog::Source::All,
+        }),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            app.catalog.search(SearchQuery {
+                q: term.clone(),
+                source: catalog::Source::Soundcloud,
+            })
+        )
+    );
+    let mut result = base?;
+    let mut notices: Vec<String> = result.notice.take().into_iter().collect();
+    match sc {
+        Ok(Ok(mut remote)) => {
+            result.tracks.append(&mut remote.tracks);
+            notices.extend(remote.notice);
+        }
+        _ => notices.push("SoundCloud не ответил вовремя. Его можно выбрать отдельно.".into()),
+    }
+    if app.spotify_app.is_some() {
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            spotify_matched(&app, &term),
+        )
+        .await;
+        match found {
+            Ok((mut tracks, total)) => {
+                let shown = tracks.len();
+                result.tracks.append(&mut tracks);
+                notices.push(format!(
+                    "Spotify: показаны совпадения с каталогом PUMP: {shown} из {total}."
+                ));
+            }
+            Err(_) => notices.push("Spotify не ответил вовремя.".into()),
+        }
+    }
+    result
+        .tracks
+        .sort_by_key(|track| track.kind != catalog::Kind::Full);
+    result.tracks.truncate(64);
+    if !notices.is_empty() {
+        notices.dedup();
+        result.notice = Some(notices.join(" "));
+    }
     Ok(Json(result))
+}
+
+/// Поиск Spotify с сопоставлением: воспроизводятся только совпадения каталога.
+async fn spotify_search(app: &App, term: &str) -> catalog::Search {
+    let Some(client) = &app.spotify_app else {
+        return catalog::Search {
+            tracks: Vec::new(),
+            notice: Some(
+                "Для поиска Spotify задай SPOTIFY_CLIENT_ID и SPOTIFY_CLIENT_SECRET.".into(),
+            ),
+        };
+    };
+    let found = match client.search_tracks(term, 12).await {
+        Ok(found) => found,
+        Err(_) => {
+            return catalog::Search {
+                tracks: Vec::new(),
+                notice: Some("Поиск Spotify недоступен.".into()),
+            };
+        }
+    };
+    let (tracks, total) = spotify_matched_inner(app, &found).await;
+    let shown = tracks.len();
+    catalog::Search {
+        tracks,
+        notice: Some(format!(
+            "Показаны совпадения с каталогом PUMP: {shown} из {total}."
+        )),
+    }
+}
+
+async fn spotify_matched(app: &App, term: &str) -> (Vec<catalog::Track>, usize) {
+    let Some(client) = &app.spotify_app else {
+        return (Vec::new(), 0);
+    };
+    let Ok(found) = client.search_tracks(term, 12).await else {
+        return (Vec::new(), 0);
+    };
+    spotify_matched_inner(app, &found).await
+}
+
+async fn spotify_matched_inner(
+    app: &App,
+    found: &[social_integrations::TrackMetadata],
+) -> (Vec<catalog::Track>, usize) {
+    let total = found.len();
+    let mut tracks = Vec::new();
+    for meta in found {
+        let q = format!("{} {}", meta.artists.join(" "), meta.title);
+        let Ok(local) = app
+            .catalog
+            .search(SearchQuery {
+                q: q.chars().take(140).collect(),
+                source: catalog::Source::Full,
+            })
+            .await
+        else {
+            continue;
+        };
+        if let Some(hit) = local
+            .tracks
+            .iter()
+            .find(|t| t.title.eq_ignore_ascii_case(&meta.title))
+        {
+            tracks.push(hit.clone());
+        }
+    }
+    (tracks, total)
 }
 
 async fn streams(
@@ -343,6 +474,68 @@ async fn stream(
         .stream(&id, format, request.method().clone(), request.headers())
         .await
         .into_response()
+}
+
+/// Прокси SoundCloud: свежая подписанная ссылка получается на каждый запрос,
+/// байты идут через сервер (работает и там, где CDN источника недоступен клиенту).
+async fn source_sc(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::http::header;
+    if id.is_empty() || id.len() > 12 || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return ApiError::missing("Запись SoundCloud не найдена.").into_response();
+    }
+    if app.catalog.track(&format!("sc-{id}")).await.is_none() {
+        return ApiError::missing("Запись SoundCloud не найдена.").into_response();
+    }
+    let stream = match app.catalog.soundcloud_client().resolve(&id).await {
+        Ok(stream) => stream,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let mut upstream_request = app
+        .http
+        .request(request.method().clone(), &stream.url)
+        .timeout(std::time::Duration::from_secs(120));
+    if let Some(range) = request.headers().get(header::RANGE) {
+        upstream_request = upstream_request.header(header::RANGE, range);
+    }
+    let upstream = match upstream_request.send().await {
+        Ok(upstream) => upstream,
+        Err(_) => return ApiError::unavailable("SoundCloud недоступен.").into_response(),
+    };
+    let status = upstream.status();
+    if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
+        return ApiError::unavailable("SoundCloud недоступен.").into_response();
+    }
+    let mime = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    if !mime.starts_with("audio/") {
+        return ApiError::unavailable("Источник вернул не аудио.").into_response();
+    }
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, no-store");
+    for name in [
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            response = response.header(name, value);
+        }
+    }
+    match response.body(axum::body::Body::from_stream(upstream.bytes_stream())) {
+        Ok(response) => response.into_response(),
+        Err(_) => ApiError::unavailable("Некорректный ответ SoundCloud.").into_response(),
+    }
 }
 
 async fn track(

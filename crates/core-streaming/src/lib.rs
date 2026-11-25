@@ -90,6 +90,8 @@ pub enum Source {
     Full,
     Preview,
     Youtube,
+    Soundcloud,
+    Spotify,
 }
 
 #[derive(Default, Deserialize)]
@@ -103,7 +105,7 @@ pub struct SearchQuery {
 #[derive(Clone, Serialize)]
 pub struct Search {
     pub tracks: Vec<Track>,
-    pub notice: Option<&'static str>,
+    pub notice: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -122,6 +124,7 @@ pub struct Catalog {
     http: reqwest::Client,
     youtube_key: Option<String>,
     auth: Option<innertube::SessionAuth>,
+    soundcloud: soundcloud::SoundCloudClient,
     streams: RwLock<HashMap<String, innertube::Streams>>,
     queries: RwLock<SearchCache>,
     lookup: RwLock<LookupCache>,
@@ -158,9 +161,10 @@ impl Catalog {
             full,
             local,
             fixed,
-            http,
+            http: http.clone(),
             youtube_key,
             auth: None,
+            soundcloud: soundcloud::SoundCloudClient::from_env(http),
             streams: RwLock::default(),
             queries: RwLock::default(),
             lookup: RwLock::default(),
@@ -409,6 +413,24 @@ impl Catalog {
         if let Some(video) = id.strip_prefix("yt-").filter(|id| valid_video(id)) {
             return Some(youtube_track(video, "Видео YouTube", ""));
         }
+        if let Some(numeric) = id
+            .strip_prefix("sc-")
+            .filter(|n| !n.is_empty() && n.len() <= 12 && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            // Комнаты и статистика принимают трек без предварительного поиска:
+            // метаданные подтягиваются с источника и живут в lookup-кэше 6 часов.
+            if let Ok(meta) = self.soundcloud.track(numeric).await
+                && meta.playback == soundcloud::Playback::Full
+            {
+                let track = soundcloud_track(&meta);
+                let mut lookup = self.lookup.write().await;
+                lookup.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6 * 3600));
+                if lookup.len() < 8192 {
+                    lookup.insert(track.id.clone(), (Instant::now(), track.clone()));
+                }
+                return Some(track);
+            }
+        }
         None
     }
 
@@ -441,19 +463,24 @@ impl Catalog {
                     Source::Youtube,
                     "YouTube сейчас недоступен. Можно открыть видео по ссылке.",
                 )),
+                Source::Soundcloud => Some((Source::Soundcloud, "SoundCloud сейчас недоступен.")),
                 Source::All | Source::Preview => {
                     Some((Source::Preview, "Каталог превью сейчас недоступен."))
                 }
-                Source::Full => None,
+                // Spotify обрабатывается уровнем выше с сопоставлением каталога.
+                Source::Full | Source::Spotify => None,
             };
             if let Some((provider, unavailable)) = remote {
                 match self.remote(provider, term).await {
                     Ok(mut results) => tracks.append(&mut results),
-                    Err(()) => notice = Some(unavailable),
+                    Err(()) => notice = Some(unavailable.into()),
                 }
             }
-        } else if matches!(query.source, Source::Preview | Source::Youtube) {
-            notice = Some("Введи название или имя артиста.");
+        } else if matches!(
+            query.source,
+            Source::Preview | Source::Youtube | Source::Soundcloud
+        ) {
+            notice = Some("Введи название или имя артиста.".into());
         }
         Ok(Search { tracks, notice })
     }
@@ -462,6 +489,7 @@ impl Catalog {
         let key = (
             match source {
                 Source::Youtube => 1,
+                Source::Soundcloud => 2,
                 _ => 0,
             },
             term.to_lowercase(),
@@ -478,6 +506,7 @@ impl Catalog {
         }
         let tracks = match source {
             Source::Youtube => self.youtube(term).await?,
+            Source::Soundcloud => self.soundcloud_search(term).await?,
             _ => self.preview(term).await?,
         };
         let now = Instant::now();
@@ -602,6 +631,26 @@ impl Catalog {
         Ok(tracks)
     }
 
+    pub fn soundcloud_client(&self) -> &soundcloud::SoundCloudClient {
+        &self.soundcloud
+    }
+
+    async fn soundcloud_search(&self, term: &str) -> Result<Vec<Track>, ()> {
+        if soundcloud::canonical_track_link(term).is_some() {
+            let (meta, _) = self.soundcloud.resolve_url(term).await.map_err(|_| ())?;
+            if meta.playback != soundcloud::Playback::Full {
+                return Err(());
+            }
+            return Ok(vec![soundcloud_track(&meta)]);
+        }
+        let metas = self.soundcloud.search(term, 12).await.map_err(|_| ())?;
+        Ok(metas
+            .iter()
+            .filter(|m| m.playback == soundcloud::Playback::Full)
+            .map(soundcloud_track)
+            .collect())
+    }
+
     pub async fn lyrics(&self, track: &Track) -> Result<Lyrics, ApiError> {
         if track.artist.is_empty() {
             return Ok(Lyrics::default());
@@ -674,6 +723,22 @@ fn video_from_input(term: &str) -> Option<String> {
         _ => return None,
     };
     valid_video(&id).then_some(id)
+}
+
+fn soundcloud_track(meta: &soundcloud::SourceTrack) -> Track {
+    Track {
+        id: format!("sc-{}", meta.id),
+        title: meta.title.clone(),
+        artist: meta.artist.clone(),
+        kind: Kind::Full,
+        duration_ms: meta.duration_ms,
+        audio_url: Some(format!("/source/sc/{}", meta.id)),
+        artwork: meta.artwork.clone(),
+        video_id: None,
+        source: "SoundCloud",
+        attribution: None,
+        provider: None,
+    }
 }
 
 fn youtube_track(id: &str, title: &str, artist: &str) -> Track {
