@@ -216,7 +216,12 @@ function selectTrack(track, remote=false) {
   audio.load();
   updateButtons();
   if (node("queueSheet").open) renderQueue();
-  if(localOnly)node("lyricsBox").replaceChildren(element("p","plain-lyrics",track.offlineLyrics||"Текст не сохранён."));else loadLyrics(track);
+  if(localOnly){
+    lyricRequest?.abort();
+    lyricLines=[];lyricWords=[];lyricIndex=-1;
+    stopLyricAnim();
+    node("lyricsBox").replaceChildren(element("p","plain-lyrics",track.offlineLyrics||"Текст не сохранён."));
+  }else loadLyrics(track);
 }
 cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback").hidden = false; });
 
@@ -349,7 +354,6 @@ async function loadLyrics(track) {
   lyricLines = [];
   lyricIndex = -1;
   lyricWords = [];
-  lyricWordIndex = -1;
   stopLyricAnim();
   const box = node("lyricsBox");
   box.replaceChildren(element("p","status","Загружаем текст…"));
@@ -365,7 +369,7 @@ async function loadLyrics(track) {
       }
     }
     lyricLines.sort((a,b)=>a.time-b.time);box.replaceChildren();
-    lyricWords=[];lyricWordIndex=-1;
+    lyricWords=[];
     if(!lyricLines.length)box.append(element("p","plain-lyrics",data.plain||"Текст не найден."));
     else lyricLines.forEach((line,i)=>{
       const button=element("button","l-line");button.type="button";button.dataset.action="lyric";button.dataset.value=String(i);
@@ -670,7 +674,7 @@ audio.addEventListener("waiting",publishSoon);
 audio.addEventListener("canplay",()=>{syncRoom();publishSoon();});
 audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
 audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); stopLyricAnim(); });
-audio.addEventListener("seeking",() => { meter = null; lyricWordIndex=-1; });
+audio.addEventListener("seeking",() => { meter = null; });
 audio.addEventListener("seeked",()=>{publishSoon();syncLyrics(true);paintLyricWords();});
 audio.addEventListener("ended",() => {
   stopLyricAnim();
@@ -883,7 +887,7 @@ document.addEventListener("visibilitychange",() => { refreshLyricAnim(); });
 document.addEventListener("click",event=>{if(event.target.closest('[data-action="youtube-embed"]')&&selected?.video_id){audio.pause();streamVideo.pause();streamVideo.hidden=true;frame.src="https://www.youtube-nocookie.com/embed/"+selected.video_id+"?autoplay=1";frame.hidden=false;mountedVideo=selected.id;node("artBox").classList.add("video");updateButtons();}});
 // Подсветка слов идёт только при видимом тексте и играющем аудио.
 // Слова кэшируются один раз при загрузке; каждый кадр трогает лишь окрестность текущей позиции.
-let lyricWords=[],lyricWordIndex=-1,lyricRaf=0;
+let lyricWords=[],lyricRaf=0;
 function lyricVisible(){return currentTab==="lyrics"||document.body.classList.contains("split-view");}
 function stopLyricAnim(){if(lyricRaf){cancelAnimationFrame(lyricRaf);lyricRaf=0;}}
 function refreshLyricAnim(){
