@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use url::Url;
 
 // Обложки сохранены из исходного прототипа, чтобы не зависеть от доступа браузера к CDN.
@@ -116,6 +116,8 @@ pub struct Lyrics {
     plain: Option<String>,
 }
 
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(180);
+static REMOTE_SEARCH_SLOTS: Semaphore = Semaphore::const_new(24);
 type SearchCache = HashMap<(u8, String), (Instant, Vec<Track>)>;
 type LookupCache = HashMap<String, (Instant, Track)>;
 
@@ -537,11 +539,14 @@ impl Catalog {
             .read()
             .await
             .get(&key)
-            .filter(|(inserted, _)| inserted.elapsed() < Duration::from_secs(180))
+            .filter(|(inserted, _)| inserted.elapsed() < SEARCH_CACHE_TTL)
             .map(|(_, results)| results.clone())
         {
             return Ok(result);
         }
+        let _permit = REMOTE_SEARCH_SLOTS
+            .try_acquire()
+            .map_err(|_| Some("Поиск занят. Повтори через несколько секунд."))?;
         let tracks = match source {
             Source::Youtube => self.youtube(term).await.map_err(|_| None)?,
             Source::Soundcloud => self.soundcloud_search(term).await?,
@@ -550,7 +555,7 @@ impl Catalog {
         };
         let now = Instant::now();
         let mut cache = self.queries.write().await;
-        cache.retain(|_, (inserted, _)| inserted.elapsed() < Duration::from_secs(180));
+        cache.retain(|_, (inserted, _)| inserted.elapsed() < SEARCH_CACHE_TTL);
         if cache.len() >= 256 {
             cache.clear();
         }
