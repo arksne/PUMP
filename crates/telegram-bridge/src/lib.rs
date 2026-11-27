@@ -557,7 +557,10 @@ async fn source_sc(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let mut upstream_request = app.http.request(request.method().clone(), &stream.url);
+    let mut upstream_request = app
+        .http
+        .request(request.method().clone(), &stream.url)
+        .timeout(std::time::Duration::from_secs(24 * 60 * 60));
     if let Some(range) = request.headers().get(header::RANGE) {
         upstream_request = upstream_request.header(header::RANGE, range);
     }
@@ -600,6 +603,7 @@ async fn source_sc(
     match response.body(axum::body::Body::from_stream(futures_util::stream::unfold(
         (upstream.bytes_stream(), Some(permit)),
         |(mut inner, permit)| async move {
+            let permit = permit?;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 futures_util::StreamExt::next(&mut inner),
@@ -611,7 +615,7 @@ async fn source_sc(
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "простой потока NAS",
+                            "простой потока SoundCloud",
                         )),
                         (inner, None),
                     ))
@@ -626,7 +630,7 @@ async fn source_sc(
                         drop(permit);
                         Some((item, (inner, None)))
                     } else {
-                        Some((item, (inner, permit)))
+                        Some((item, (inner, Some(permit))))
                     }
                 }
             }
