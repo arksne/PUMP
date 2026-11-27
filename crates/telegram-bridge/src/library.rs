@@ -66,7 +66,9 @@ pub(crate) async fn download(
         .await
         .ok_or_else(|| ApiError::missing("Трек не найден."))?;
     if track.source == "Audius" {
-        return Err(ApiError::invalid("Для Audius доступно потоковое прослушивание, не скачивание."));
+        return Err(ApiError::invalid(
+            "Для Audius доступно потоковое прослушивание, не скачивание.",
+        ));
     }
     let audio = track
         .audio_url
