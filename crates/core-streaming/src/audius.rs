@@ -186,8 +186,8 @@ impl AudiusClient {
     ) -> Result<reqwest::Response, ApiError> {
         // Recheck permissions before every new media request.
         self.track(id).await?;
-        let mut url = Url::parse(&format!("{}/tracks/{id}/stream", self.api))
-            .map_err(|_| unavailable())?;
+        let mut url =
+            Url::parse(&format!("{}/tracks/{id}/stream", self.api)).map_err(|_| unavailable())?;
         url.query_pairs_mut()
             .append_pair("preview", "false")
             .append_pair("app_name", "PUMP");
