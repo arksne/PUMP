@@ -460,7 +460,29 @@ impl Catalog {
             );
         }
         let mut notice = None;
-        if !term.is_empty() {
+        if !term.is_empty() && matches!(query.source, Source::All) {
+            // Providers fail independently; a preview must not hide full recordings.
+            let deadline = Duration::from_secs(4);
+            let (soundcloud, youtube, preview) = tokio::join!(
+                tokio::time::timeout(deadline, self.remote(Source::Soundcloud, term)),
+                tokio::time::timeout(deadline, self.remote(Source::Youtube, term)),
+                tokio::time::timeout(deadline, self.remote(Source::Preview, term)),
+            );
+            let mut failed = Vec::new();
+            for (name, result) in [
+                ("SoundCloud", soundcloud),
+                ("YouTube", youtube),
+                ("iTunes", preview),
+            ] {
+                match result {
+                    Ok(Ok(mut results)) => tracks.append(&mut results),
+                    _ => failed.push(name),
+                }
+            }
+            if !failed.is_empty() {
+                notice = Some(format!("Источники недоступны: {}.", failed.join(", ")));
+            }
+        } else if !term.is_empty() {
             let remote = match query.source {
                 Source::Youtube => Some((
                     Source::Youtube,
