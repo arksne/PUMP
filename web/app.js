@@ -19,6 +19,8 @@ let crossfadeSeconds=Number(stored("pump.crossfadeSeconds",0));
 if(![0,2,4,6,8].includes(crossfadeSeconds))crossfadeSeconds=0;
 let automixEnabled=stored("pump.automixEnabled",false)===true;
 let transition=null,transitionFailed=null;
+const analysisCache=new Map();
+let analysisRequest=null,rateRamp=null;
 let mountedVideo = null, lyricLines = [], lyricIndex = -1, lyricRequest = null;
 let lyricLineEnds=[],lyricLineMaxEnds=[],lyricLineActive=new Set();
 let searchRequest = null, searchTimer = null, statsSeq = 0;
@@ -194,7 +196,7 @@ function clearVideo() {
 function selectTrack(track, remote=false, prepared=false) {
   if (!track || (!remote && isGuest())) return;
   if(room?.host)cancelHostStart(room);
-  if(!prepared)cancelCrossfade();
+  if(!prepared){cancelCrossfade();stopRateRamp();}
   transitionFailed=null;
   finalizeListen();
   if(!prepared){audio.pause();audio.removeAttribute("src");}
@@ -236,6 +238,7 @@ function selectTrack(track, remote=false, prepared=false) {
     resetLyricState();
     node("lyricsBox").replaceChildren(element("p","plain-lyrics",track.offlineLyrics||"Текст не сохранён."));
   }else loadLyrics(track);
+  prepareAutomix(track);
 }
 cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback").hidden = false; });
 
@@ -327,7 +330,7 @@ function like() {
   updateButtons();
 }
 function setRate(value, button) {
-  cancelCrossfade();
+  cancelCrossfade();stopRateRamp();
   rate = Number(value);
   audio.playbackRate = rate;
   document.querySelectorAll("[data-action=rate]").forEach(item => item.classList.toggle("active",button === item));
@@ -530,7 +533,7 @@ async function joinRoom(raw) {
   const code = raw.trim().toLowerCase();
   if (!/^[0-9a-f]{12}$/.test(code)) throw new Error("Введи 12 символов кода комнаты.");
   await session();
-  cancelCrossfade();
+  cancelCrossfade();stopRateRamp();
   leaveRoom();
   clearVideo();
   const address = new URL("/ws/room/"+code,location.href);
@@ -854,7 +857,7 @@ function startAudioGraph() {
     const deckGains=new Map();
     for(const deck of decks){
       const input=context.createMediaElementSource(deck),gain=context.createGain();
-      gain.gain.value=deck===audio?1:0;
+      gain.gain.value=deck===audio?analysisGain(selected):0;
       input.connect(gain);gain.connect(source);deckGains.set(deck,gain);
     }
     const preamp=context.createGain();
@@ -870,6 +873,72 @@ function startAudioGraph() {
 }
 // Two media decks share the same WebAudio DSP chain. The active DOM id
 // follows the audible deck; the incoming deck is not reloaded at handoff.
+function localMixTrack(track){return Boolean(track&&track.source==="Медиатека"&&track.kind==="full"&&!track.offlineBlob);}
+function knownAnalysis(track){return track&&analysisCache.get(track.id);}
+function analysisGain(track){
+  const lufs=knownAnalysis(track)?.integrated_lufs;
+  // Never amplify unknown or quiet audio; avoid transition clipping.
+  return automixEnabled&&!room&&Number.isFinite(lufs)?Math.pow(10,Math.max(-12,Math.min(0,-14-lufs))/20):1;
+}
+function showAnalysis(track,result){
+  if(selected!==track)return;
+  const parts=[];
+  if(Number.isFinite(result?.bpm)&&result.bpm_confidence>=.35)parts.push(Math.round(result.bpm)+" BPM");
+  if(result?.key&&result.key_confidence>=.35)parts.push(result.key);
+  if(Number.isFinite(result?.integrated_lufs))parts.push(result.integrated_lufs.toFixed(1)+" LUFS");
+  text("analysisStatus",parts.length?parts.join(" · "):"Нет уверенных музыкальных параметров; обычный переход.");
+}
+async function getAnalysis(track,signal){
+  if(!localMixTrack(track))return null;
+  if(analysisCache.has(track.id))return analysisCache.get(track.id);
+  await session();signal.throwIfAborted();
+  let result;
+  for(let attempt=0;attempt<3;attempt++){
+    try{result=await api("/api/analysis/"+encodeURIComponent(track.id),{auth:true,signal});break;}
+    catch(error){
+      if(error.status!==429||attempt===2)throw error;
+      await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));signal.throwIfAborted();
+    }
+  }
+  signal.throwIfAborted();
+  analysisCache.set(track.id,result);
+  while(analysisCache.size>32)analysisCache.delete(analysisCache.keys().next().value);
+  return result;
+}
+async function prepareAutomix(track){
+  analysisRequest?.abort();analysisRequest=null;
+  if(!automixEnabled||room||localOnly||!localMixTrack(track)){
+    text("analysisStatus",automixEnabled?"Automix-анализ доступен для локальной медиатеки вне комнат.":"");
+    return;
+  }
+  const controller=new AbortController();analysisRequest=controller;
+  text("analysisStatus","Анализируем музыку…");
+  try{
+    const result=await getAnalysis(track,controller.signal);
+    if(selected!==track||controller.signal.aborted)return;
+    showAnalysis(track,result);
+    if(!transition&&graph)deckGain(audio,analysisGain(track));
+    const next=queue[(index+1)%queue.length];
+    if(next&&next.id!==track.id&&localMixTrack(next))await getAnalysis(next,controller.signal);
+  }catch(error){
+    if(!controller.signal.aborted&&selected===track)text("analysisStatus","Анализ недоступен; обычный переход. "+error.message);
+  }finally{if(analysisRequest===controller)analysisRequest=null;}
+}
+function stopRateRamp(){
+  clearInterval(rateRamp);rateRamp=null;
+  if(audio)audio.playbackRate=rate;
+}
+function settleRate(deck,from){
+  clearInterval(rateRamp);rateRamp=null;
+  if(Math.abs(from-rate)<.001)return;
+  const target=rate,start=performance.now();
+  rateRamp=setInterval(()=>{
+    if(deck!==audio||room||rate!==target){stopRateRamp();return;}
+    const progress=Math.min(1,(performance.now()-start)/1800);
+    deck.playbackRate=from+(target-from)*progress;
+    if(progress===1){clearInterval(rateRamp);rateRamp=null;}
+  },100);
+}
 function deckGain(deck,value){
   const gain=graph?.deckGains.get(deck)?.gain;
   if(!gain)return;
@@ -883,7 +952,7 @@ function cancelCrossfade(){
   const state=transition;
   if(!state)return;
   transition=null;clearTimeout(state.timer);
-  deckGain(audio,1);
+  deckGain(audio,analysisGain(selected));
   if(state.to!==audio)stopDeck(state.to);
 }
 function directMixUrl(track){
@@ -895,20 +964,43 @@ function mixCandidate(){
   if(!graph||graph.context.state!=="running"||room||sleep||repeat||shuffle||localOnly||!selected||!directMixUrl(selected)||queue.length<2||index<0)return null;
   const nextIndex=(index+1)%queue.length,track=queue[nextIndex],url=directMixUrl(track);
   if(!url||track.id===selected.id)return null;
-  return {track,nextIndex,url,key:selected.id+"|"+track.id};
+  const auto=automixEnabled&&localMixTrack(selected)&&localMixTrack(track);
+  let seconds=crossfadeSeconds||(auto?4:0),cue=0,incomingRate=rate;
+  if(seconds<=0)return null;
+  const from=auto?knownAnalysis(selected):null,to=auto?knownAnalysis(track):null;
+  if(from&&to){
+    // Align the outgoing fade to a nearby confident beat, without cutting
+    // more than one second away from the user's requested fade duration.
+    if(from.beat_confidence>=.35&&Array.isArray(from.beats)&&Number.isFinite(audio.duration)){
+      const desired=audio.duration-seconds*audio.playbackRate;
+      const beat=from.beats.filter(t=>Number.isFinite(t)&&Math.abs(t-desired)<=1)
+        .sort((a,b)=>Math.abs(a-desired)-Math.abs(b-desired))[0];
+      if(Number.isFinite(beat))seconds=Math.max(1,Math.min(10,(audio.duration-beat)/audio.playbackRate));
+    }
+    if(to.beat_confidence>=.35&&Array.isArray(to.beats)){
+      const first=to.beats.find(t=>Number.isFinite(t)&&t>=0&&t<=1.5);
+      if(Number.isFinite(first))cue=first;
+    }
+    if(from.bpm_confidence>=.35&&to.bpm_confidence>=.35&&from.bpm>0&&to.bpm>0){
+      const ratios=[from.bpm/to.bpm,from.bpm/(2*to.bpm),2*from.bpm/to.bpm];
+      const ratio=ratios.sort((a,b)=>Math.abs(a-1)-Math.abs(b-1))[0];
+      if(Math.abs(ratio-1)<=.04)incomingRate=Math.max(.5,Math.min(2,rate*ratio));
+    }
+  }
+  return {track,nextIndex,url,key:selected.id+"|"+track.id,seconds,cue,incomingRate};
 }
 function maybeCrossfade(){
-  const seconds=crossfadeSeconds;
-  if(seconds<=0||audio.paused||audio.seeking||!Number.isFinite(audio.duration)){cancelCrossfade();return;}
+  if(audio.paused||audio.seeking||!Number.isFinite(audio.duration)){cancelCrossfade();return;}
   const candidate=mixCandidate();
   if(!candidate||candidate.key===transitionFailed){cancelCrossfade();return;}
   const remaining=(audio.duration-audio.currentTime)/audio.playbackRate;
   if(transition&&transition.key!==candidate.key)cancelCrossfade();
+  const seconds=transition?.seconds??candidate.seconds;
   if(!transition&&remaining<=seconds+8&&remaining>0.25){
     const to=decks.find(deck=>deck!==audio);
-    const state={...candidate,from:audio,to,phase:"preload",timer:null};
+    const state={...candidate,from:audio,to,phase:"preload",timer:null,cued:false};
     transition=state;deckGain(to,0);
-    to.preload="auto";to.src=candidate.url;to.playbackRate=rate;to.volume=audio.volume;to.load();
+    to.preload="auto";to.src=candidate.url;to.playbackRate=candidate.incomingRate;to.volume=audio.volume;to.load();
   }
   const state=transition;
   if(!state)return;
@@ -916,7 +1008,12 @@ function maybeCrossfade(){
     if(graph.context.currentTime>=state.endAt)finishCrossfade(state);
     return;
   }
-  if(state.phase!=="preload"||remaining>seconds||state.to.readyState<2)return;
+  if(state.phase!=="preload")return;
+  if(!state.cued&&state.to.readyState>=1){
+    state.cued=true;
+    if(state.cue>0&&Number.isFinite(state.to.duration)&&state.cue<state.to.duration-1)state.to.currentTime=state.cue;
+  }
+  if(remaining>seconds||state.to.readyState<2||state.to.seeking)return;
   state.phase="starting";
   state.to.play().then(()=>{
     if(transition!==state)return;
@@ -929,7 +1026,7 @@ function maybeCrossfade(){
     const a=new Float32Array(65),b=new Float32Array(65);
     for(let i=0;i<a.length;i++){
       const theta=i/(a.length-1)*Math.PI/2,x=Math.cos(theta),y=Math.sin(theta),headroom=Math.max(1,x+y);
-      a[i]=x/headroom;b[i]=y/headroom;
+      a[i]=x/headroom*analysisGain(selected);b[i]=y/headroom*analysisGain(state.track);
     }
     out.cancelScheduledValues(now);inc.cancelScheduledValues(now);
     out.setValueCurveAtTime(a,now,duration);inc.setValueCurveAtTime(b,now,duration);
@@ -947,13 +1044,14 @@ function finishCrossfade(state){
   finalizeListen();
   const previous=audio;
   previous.id="audioStandby";audio=state.to;audio.id="audio";
-  deckGain(audio,1);stopDeck(previous);
+  deckGain(audio,analysisGain(state.track));stopDeck(previous);
   index=state.nextIndex;selectTrack(state.track,false,true);
+  settleRate(audio,state.incomingRate);
   updateTimeline();updateButtons();rememberPlayingTrack();refreshLyricAnim();
   return true;
 }
 for(const deck of decks){
-  deck.addEventListener("canplay",()=>{if(transition?.to===deck)maybeCrossfade();});
+  for(const event of ["loadedmetadata","canplay","seeked"])deck.addEventListener(event,()=>{if(transition?.to===deck)maybeCrossfade();});
   for(const event of ["error","ended","waiting"])deck.addEventListener(event,()=>{
     if(transition?.to!==deck)return;
     if(event==="waiting"&&transition.phase==="preload")return;
@@ -962,11 +1060,13 @@ for(const deck of decks){
 }
 node("crossfadeSeconds").value=String(crossfadeSeconds);
 node("crossfadeSeconds").addEventListener("change",()=>{
-  cancelCrossfade();crossfadeSeconds=Number(node("crossfadeSeconds").value);persist("pump.crossfadeSeconds",crossfadeSeconds);
+  cancelCrossfade();transitionFailed=null;crossfadeSeconds=Number(node("crossfadeSeconds").value);persist("pump.crossfadeSeconds",crossfadeSeconds);
 });
 node("automixEnabled").checked=automixEnabled;
 node("automixEnabled").addEventListener("change",()=>{
+  cancelCrossfade();transitionFailed=null;
   automixEnabled=node("automixEnabled").checked;persist("pump.automixEnabled",automixEnabled);
+  stopRateRamp();deckGain(audio,analysisGain(selected));prepareAutomix(selected);
 });
 function applyEq() {
   if (!graph) return;
