@@ -231,6 +231,10 @@ class PlayerTest(unittest.TestCase):
         _,_,data=self.request("/api/search?source=soundcloud&q=Stub")
         found={t["id"]:t for t in json.loads(data)["tracks"]}
         self.assertEqual(set(found),{"sc-424242","sc-434343"})
+        # The default search must expose full remote recordings, not just previews.
+        _,_,combined=self.request("/api/search?source=all&q=Stub")
+        combined_tracks=json.loads(combined)["tracks"]
+        self.assertTrue(any(t["id"]=="sc-424242" and t["kind"]=="full" for t in combined_tracks))
         track=found["sc-424242"]
         self.assertEqual((track["title"],track["source"]),("Stub Loop","SoundCloud"))
         self.assertEqual(track["audio_url"],"/source/sc/424242")
