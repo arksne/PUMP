@@ -342,49 +342,38 @@ async fn search(
         let result = app.catalog.search(query).await?;
         return Ok(Json(result));
     }
-    // Общий поиск: локальный каталог, превью, YouTube и SoundCloud идут
-    // параллельно с пределом времени; Spotify добавляется совпадающим.
+    // Catalog::All already queries all public providers in parallel.
+    // Spotify only contributes matched records, not a second audio stream.
     let term = query.q.clone();
-    let (base, sc) = tokio::join!(
-        app.catalog.search(SearchQuery {
-            q: term.clone(),
-            source: catalog::Source::All,
-        }),
-        tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            app.catalog.search(SearchQuery {
-                q: term.clone(),
-                source: catalog::Source::Soundcloud,
-            })
-        )
-    );
+    let spotify = async {
+        if app.spotify_app.is_some() {
+            Some(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    spotify_matched(&app, &term),
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    };
+    let (base, found) = tokio::join!(app.catalog.search(query), spotify);
     let mut result = base?;
     let mut notices: Vec<String> = result.notice.take().into_iter().collect();
-    match sc {
-        Ok(Ok(mut remote)) => {
-            result.tracks.append(&mut remote.tracks);
-            notices.extend(remote.notice);
+    match found {
+        Some(Ok((mut tracks, total))) => {
+            let shown = tracks.len();
+            result.tracks.append(&mut tracks);
+            notices.push(format!(
+                "Spotify: показаны совпадения с каталогом PUMP: {shown} из {total}."
+            ));
         }
-        Ok(Err(_)) => notices.push("SoundCloud недоступен. Его можно выбрать отдельно.".into()),
-        Err(_) => notices.push("SoundCloud не ответил вовремя. Его можно выбрать отдельно.".into()),
+        Some(Err(_)) => notices.push("Spotify не ответил вовремя.".into()),
+        None => {}
     }
-    if app.spotify_app.is_some() {
-        let found = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            spotify_matched(&app, &term),
-        )
-        .await;
-        match found {
-            Ok((mut tracks, total)) => {
-                let shown = tracks.len();
-                result.tracks.append(&mut tracks);
-                notices.push(format!(
-                    "Spotify: показаны совпадения с каталогом PUMP: {shown} из {total}."
-                ));
-            }
-            Err(_) => notices.push("Spotify не ответил вовремя.".into()),
-        }
-    }
+    let mut seen = std::collections::HashSet::new();
+    result.tracks.retain(|track| seen.insert(track.id.clone()));
     result
         .tracks
         .sort_by_key(|track| track.kind != catalog::Kind::Full);
