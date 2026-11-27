@@ -105,6 +105,65 @@ def soundcloud_stub(media, entries, client_id="a"*32):
     return ScHandler
 
 
+def audius_stub(media):
+    """Official API shape, public/gated metadata, redirect and byte ranges."""
+    def metadata(ident):
+        return {"id": ident, "title": "Audius Test " + ident, "user": {"name": "Fixture Artist"},
+                "duration": 40, "is_streamable": True, "is_stream_gated": ident == "Gated1"}
+    class Handler(BaseHTTPRequestHandler):
+        def payload(self, data):
+            body=json.dumps({"data":data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            path=self.path.split("?")[0]
+            if path=="/v1/tracks/search":
+                self.payload([metadata("Public1"),metadata("Gated1")])
+            elif path in ("/v1/tracks/Public1","/v1/tracks/Gated1","/v1/tracks/Unsafe1"):
+                self.payload(metadata(path.rsplit("/",1)[1]))
+            elif path=="/v1/tracks/Public1/stream":
+                if "preview=false" not in self.path:
+                    self.send_error(400)
+                    return
+                self.send_response(302)
+                self.send_header("Location","/cdn/public.mp3")
+                self.end_headers()
+            elif path=="/v1/tracks/Unsafe1/stream":
+                self.send_response(302)
+                self.send_header("Location","http://127.0.0.1:1/private")
+                self.end_headers()
+            elif path=="/cdn/public.mp3":
+                start,end=0,len(media)-1
+                value=self.headers.get("Range")
+                if value:
+                    found=re.fullmatch(r"bytes=(\d+)-(\d*)",value)
+                    if not found:
+                        self.send_error(416)
+                        return
+                    start=int(found[1]);end=min(int(found[2]) if found[2] else end,end)
+                    if start>end:
+                        self.send_response(416)
+                        self.send_header("Content-Range",f"bytes */{len(media)}")
+                        self.end_headers()
+                        return
+                self.send_response(206 if value else 200)
+                self.send_header("Content-Type","audio/mpeg")
+                self.send_header("Content-Length",str(end-start+1))
+                self.send_header("Accept-Ranges","bytes")
+                if value:
+                    self.send_header("Content-Range",f"bytes {start}-{end}/{len(media)}")
+                self.end_headers()
+                self.wfile.write(media[start:end+1])
+            else:
+                self.send_error(404)
+        def log_message(self,*args):
+            pass
+    return Handler
+
+
 class PlayerTest(unittest.TestCase):
     def setUp(self):
         self.folder = TemporaryDirectory(prefix="pump-browser-")
@@ -191,6 +250,51 @@ class PlayerTest(unittest.TestCase):
         stats = json.loads(data)
         self.assertEqual((stats["tracks"], stats["milliseconds"]), (1, 1200))
         self.assertEqual(stats["top_artists"][0]["title"], track["artist"])
+
+    def test_audius_public_search_stream_range_and_gates(self):
+        media=(self.root/"music/alpha.mp3").read_bytes()
+        stub=ThreadingHTTPServer(("127.0.0.1",0),audius_stub(media))
+        threading.Thread(target=stub.serve_forever,daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        self.stop()
+        self.environment["PUMP_AUDIUS_TEST_API_BASE"]=f"http://127.0.0.1:{stub.server_port}/v1"
+        self.start()
+        _,_,data=self.request("/api/search?source=audius&q=Fixture")
+        tracks=json.loads(data)["tracks"]
+        self.assertEqual([t["id"] for t in tracks],["au-Public1"])
+        self.assertEqual((tracks[0]["source"],tracks[0]["kind"],tracks[0]["duration_ms"]),("Audius","full",40000))
+        status,headers,part=self.request(tracks[0]["audio_url"],headers={"Range":"bytes=100-199"})
+        self.assertEqual((status,part),(206,media[100:200]))
+        self.assertEqual(headers["Content-Range"],f"bytes 100-199/{len(media)}")
+        with self.assertRaises(HTTPError) as gated:
+            self.request("/source/au/Gated1")
+        self.assertEqual(gated.exception.code,409)
+        with self.assertRaises(HTTPError) as unsafe:
+            self.request("/source/au/Unsafe1")
+        self.assertEqual(unsafe.exception.code,502)
+        with self.assertRaises(HTTPError) as invalid:
+            self.request("/source/au/Public1",headers={"Range":"bytes=0-1,4-5"})
+        self.assertEqual(invalid.exception.code,416)
+        _,_,metadata=self.request("/api/tracks/au-Public1")
+        self.assertEqual(json.loads(metadata)["id"],"au-Public1")
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("audius")
+            page.locator("#qInput").fill("Fixture")
+            page.get_by_role("button",name="Audius Test Public1",exact=False).click()
+            wait_for_audio(page,"audio => !audio.paused && audio.currentTime > 0.5")
+            page.locator("#seekBar").evaluate("(bar) => { bar.value = 50; bar.dispatchEvent(new Event('input', {bubbles: true})); }")
+            wait_for_audio(page,"audio => audio.currentTime >= 19.5")
+            self.assertEqual(errors,[])
+            browser.close()
 
     def test_external_sources_shape_and_guards(self):
         _, _, data = self.request("/api/search?source=spotify&q=North")
