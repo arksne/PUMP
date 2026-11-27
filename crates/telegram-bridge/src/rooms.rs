@@ -172,11 +172,14 @@ pub(crate) async fn upgrade(
         .cloned()
         .filter(|room| now_ms().saturating_sub(room.activity.load(Ordering::Relaxed)) < LIFETIME)
         .ok_or_else(|| ApiError::missing("Комната не найдена."))?;
-    let global = CONNECTIONS.try_acquire().map_err(|_| {
-        ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Сервер комнат занят.")
-    })?;
+    let global = CONNECTIONS
+        .try_acquire()
+        .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Сервер комнат занят."))?;
     let peer = room.peers.clone().try_acquire_owned().map_err(|_| {
-        ApiError::new(StatusCode::TOO_MANY_REQUESTS, "В комнате нет свободных мест.")
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "В комнате нет свободных мест.",
+        )
     })?;
     Ok(ws
         .max_message_size(4096)
