@@ -846,7 +846,7 @@ document.addEventListener("click",async event=>{
  try{
   if(action==="eq-reset"){eqGains.fill(0);node("preamp").value="0";node("eqBands").querySelectorAll("input").forEach(input=>input.value="0");applyEq();}
   if(action==="output-refresh")await refreshOutputs();
-  if(action==="download"){if(!selected||!audio.src)throw new Error("Выбери аудиотрек.");text("offlineStatus","Скачиваем…");await PumpUX.download(selected,audio.src);await showDownloads();text("offlineStatus","Запись доступна на этом устройстве.");}
+  if(action==="download"){if(!selected||!audio.src)throw new Error("Выбери аудиотрек.");if(selected.source==="Audius")throw new Error("Для Audius доступно потоковое прослушивание, не скачивание.");text("offlineStatus","Скачиваем…");await PumpUX.download(selected,audio.src);await showDownloads();text("offlineStatus","Запись доступна на этом устройстве.");}
   if(action==="offline-enable"){if(!navigator.serviceWorker)throw new Error("Офлайн-интерфейс недоступен.");await navigator.serviceWorker.register("/sw.js");text("offlineStatus","Офлайн-интерфейс включён.");await showDownloads();}
   if(action==="history-clear"){persist("pump.history",[]);text("settingsStatus","История очищена.");}
   if(action==="show-history"){results=stored("pump.history",[]);renderResults("История прослушиваний");settings(false);goTab("search");}
@@ -1087,6 +1087,7 @@ loadProviders();
 // Очередь импортированного плейлиста скачивается последовательно, с явным итогом.
 let queueDownload=null;
 async function queueDownloadSources(track,signal){
+ if(track.source==="Audius")throw new Error("Для Audius доступно потоковое прослушивание, не скачивание.");
  if(track.provider){
   const data=await api("/api/providers/"+encodeURIComponent(track.provider.provider_id)+"/resolve",{
    method:"POST",signal,body:{abi_version:1,track_id:track.provider.track_id,quality:{preferred:"high",prefer_lossless:true,allow_fallback:true}}
