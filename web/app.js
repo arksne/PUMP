@@ -605,6 +605,7 @@ function connectRoom(state) {
         const best=state.clockSamples.reduce((a,b)=>a.rtt<=b.rtt?a:b);
         state.rtt=best.rtt;
         state.skew=best.skew;
+        if(state.host===false&&state.guestStartAt!==null){clearGuestStart(state);syncRoom();}
       }
     } else if (response.type === "error") {
       text("roomStatus",response.message);
@@ -653,10 +654,10 @@ function leaveRoom() {
   renderRoom();
 }
 function pingRoom() {
-  if (room?.connected && room.socket.readyState === WebSocket.OPEN) room.socket.send(JSON.stringify({type:"ping",sent_ms:Math.round(roomNow())}));
+  if (room?.connected && room.socket.readyState === WebSocket.OPEN && room.socket.bufferedAmount<8192) room.socket.send(JSON.stringify({type:"ping",sent_ms:Math.round(roomNow())}));
 }
 function publish(paused=false) {
-  if (!room?.host || !room.connected || room.socket.readyState !== WebSocket.OPEN) return;
+  if (!room?.host || !room.connected || room.socket.readyState !== WebSocket.OPEN || room.socket.bufferedAmount>=8192) return;
   const direct = selected && selected.kind !== "youtube";
   const sampled=Math.round(roomNow()+room.skew);
   const pendingStart=!paused&&direct&&room.hostStart?.trackId===selected.id&&room.hostStart.at>=sampled-100?room.hostStart.at:null;
@@ -675,6 +676,7 @@ function publishSoon() {
 }
 async function applyRemote(state,playback) {
   if (state.desired && playback.revision < state.desired.revision) return;
+  if(state.desired?.track_id!==playback.track_id||!playback.playing)state.joinSeekAt=null;
   if(state.desired?.at_ms!==playback.at_ms||!playback.playing)clearGuestStart(state);
   state.desired = playback;
   if (!playback.track_id) {
@@ -724,8 +726,14 @@ function syncRoom() {
   const next=Math.min(Math.max(0,position),audio.duration);
   const drift=next-audio.currentTime;
   const shouldPlay=target.playing&&untilStart<=0&&room.sound&&next<audio.duration;
-  // Seek for discontinuities; gently correct small network and decoder drift.
-  if(Math.abs(drift)>(shouldPlay&&!audio.paused ? .65 : .05))audio.currentTime=next;
+  // A moving playhead must not trigger endless seeks before a paused guest
+  // can start. Seek once, then let playback begin after seeked/canplay.
+  const threshold=shouldPlay?(audio.paused ? .25 : .65):.05;
+  const recentJoinSeek=shouldPlay&&audio.paused&&performance.now()-(state.joinSeekAt??-Infinity)<1000;
+  if(Math.abs(drift)>threshold&&!recentJoinSeek){
+    audio.currentTime=next;
+    if(shouldPlay&&audio.paused){state.joinSeekAt=performance.now();return;}
+  }
   const correction=shouldPlay&&!audio.paused&&Math.abs(drift)>.035&&Math.abs(drift)<=.65
     ?Math.max(-.04,Math.min(.04,drift*.2)):0;
   const correctedRate=Math.max(.5,Math.min(2,target.rate*(1+correction)));
@@ -1159,7 +1167,7 @@ function rememberPlayingTrack(){
  if(navigator.mediaSession){navigator.mediaSession.metadata=new MediaMetadata({title:selected.title,artist:selected.artist,artwork:asset(selected.artwork)?[{src:asset(selected.artwork)}]:[]});}
 }
 onActiveAudio("playing",rememberPlayingTrack);
-if(navigator.mediaSession){for(const [action,handler] of Object.entries({play:()=>requestPlay(),pause:()=>audio.pause(),nexttrack:()=>step(1),previoustrack:()=>step(-1),seekto:event=>{if(!isGuest()&&event)audio.currentTime=event.seekTime;}})){try{navigator.mediaSession.setActionHandler(action,event=>{if(!isGuest())handler(event);});}catch{}}}
+if(navigator.mediaSession){for(const [action,handler] of Object.entries({play:()=>requestPlay(),pause:()=>{cancelHostStart(room);audio.pause();publishSoon();updateButtons();},nexttrack:()=>step(1),previoustrack:()=>step(-1),seekto:event=>{if(!isGuest()&&event)audio.currentTime=event.seekTime;}})){try{navigator.mediaSession.setActionHandler(action,event=>{if(!isGuest())handler(event);});}catch{}}}
 function connectControls(){
  if(localOnly)return;
  if(remoteSocket&&remoteSocket.readyState<=1)return;
@@ -1170,7 +1178,7 @@ function connectControls(){
  socket.addEventListener("message",async event=>{try{
   const command=JSON.parse(event.data);if(command.type!=="command"||isGuest())return;
   if(command.track_id){const track=known.get(command.track_id)||await api("/api/tracks/"+encodeURIComponent(command.track_id));queue.push(track);if(command.action==="play"){index=queue.length-1;selectTrack(track);}}
-  switch(command.action){case"play":requestPlay();break;case"pause":audio.pause();break;case"next":step(1);break;case"previous":step(-1);break;case"seek":if(Number.isFinite(audio.duration))audio.currentTime=Math.min(command.position_ms/1000,audio.duration);break;case"eq":if(Array.isArray(command.bands)&&command.bands.length===10){eqGains=command.bands;node("eqEnabled").checked=true;startAudioGraph();applyEq();node("eqBands").querySelectorAll("input").forEach((input,i)=>input.value=String(eqGains[i]));}break;}
+  switch(command.action){case"play":requestPlay();break;case"pause":cancelHostStart(room);audio.pause();publishSoon();updateButtons();break;case"next":step(1);break;case"previous":step(-1);break;case"seek":if(Number.isFinite(audio.duration))audio.currentTime=Math.min(command.position_ms/1000,audio.duration);break;case"eq":if(Array.isArray(command.bands)&&command.bands.length===10){eqGains=command.bands;node("eqEnabled").checked=true;startAudioGraph();applyEq();node("eqBands").querySelectorAll("input").forEach((input,i)=>input.value=String(eqGains[i]));}break;}
  }catch(error){text("playerStatus",error.message);}});
 }
 showDownloads().catch(()=>{});
