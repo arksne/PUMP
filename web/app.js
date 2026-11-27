@@ -182,6 +182,7 @@ function clearVideo() {
 }
 function selectTrack(track, remote=false) {
   if (!track || (!remote && isGuest())) return;
+  if(room?.host)cancelHostStart(room);
   finalizeListen();
   audio.pause();
   audio.removeAttribute("src");
@@ -226,9 +227,9 @@ function selectTrack(track, remote=false) {
 }
 cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback").hidden = false; });
 
-function requestPlay() {
+function requestPlay(immediate=false) {
   startAudioGraph();
-  if(isGuest()&&(!room.connected||!room.sound||!room.desired?.playing||selected?.id!==room.desired.track_id))return;
+  if(isGuest()&&(!room.connected||!room.sound||!room.desired?.playing||selected?.id!==room.desired.track_id||room.desired.at_ms>roomNow()+room.skew))return;
   if (selected?.kind === "youtube") {
     if(!streamCandidates.length){loadStreams();return;}
     playStreamCandidate();return;
@@ -240,10 +241,14 @@ function requestPlay() {
     return;
   }
   if (!audio.getAttribute("src")) return;
+  if(!immediate&&room?.host&&room.connected&&audio.paused){scheduleHostStart(room);return;}
+  const track=selected;
+  const state=room;
   audio.play().catch(error => {
+    if(selected!==track||room!==state)return;
     if (error.name === "AbortError") return;
     if (isGuest()) { room.sound = false; renderRoom(); }
-    else text("playerStatus","Не удалось начать. Попробуй нажать Play ещё раз.");
+    else {text("playerStatus","Не удалось начать. Попробуй нажать Play ещё раз.");publishSoon();updateButtons();}
   });
 }
 function pick(i) {
@@ -282,6 +287,7 @@ function playPause() {
   if (isGuest()) return;
   if (!selected) { if (results.length) pick(0); else goTab("search"); return; }
   if (selected.kind === "youtube") { if (!audio.paused && !streamVideo.src) audio.pause(); else if(!streamVideo.paused)streamVideo.pause();else requestPlay(); return; }
+  if(room?.hostStart){cancelHostStart(room);publishSoon();updateButtons();return;}
   if (audio.paused) requestPlay(); else audio.pause();
 }
 function pressed(id,value,css) {
@@ -289,7 +295,7 @@ function pressed(id,value,css) {
   node(id).setAttribute("aria-pressed",String(value));
 }
 function updateButtons() {
-  const guest = isGuest(), playing = !audio.paused && !audio.ended;
+  const guest = isGuest(), playing = Boolean(room?.hostStart||(!audio.paused&&!audio.ended));
   node("playBtn").classList.toggle("is-playing",playing);
   node("playBtn").setAttribute("aria-label",playing ? "Пауза" : "Играть");
   node("playBtn").disabled = guest || Boolean(mountedVideo);
@@ -514,13 +520,38 @@ async function joinRoom(raw) {
   clearVideo();
   const address = new URL("/ws/room/"+code,location.href);
   address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
-  const state = {code,address,socket:null,host:null,sound:false,desired:null,skew:0,rtt:Infinity,clockSamples:[],loading:null,trackRequest:0,timer:null,retryTimer:null,retries:0,connected:false};
+  const state = {code,address,socket:null,host:null,sound:false,desired:null,skew:0,rtt:Infinity,clockSamples:[],loading:null,trackRequest:0,timer:null,retryTimer:null,retries:0,connected:false,hostStart:null,guestStartTimer:null,guestStartAt:null};
   room = state;
+  audio.preload="auto";
   text("roomStatus","Подключаемся…");
   connectRoom(state);
 }
 // Use an epoch anchored to the monotonic browser clock, not wall-clock changes.
 function roomNow(){return performance.timeOrigin+performance.now();}
+function cancelHostStart(state){
+  if(!state?.hostStart)return;
+  clearTimeout(state.hostStart.timer);
+  state.hostStart=null;
+}
+function clearGuestStart(state){
+  clearTimeout(state.guestStartTimer);
+  state.guestStartTimer=null;state.guestStartAt=null;
+}
+function scheduleHostStart(state){
+  if(room!==state||!state.connected||!state.host||!selected||state.hostStart)return;
+  const delay=Math.max(900,Math.min(2200,Number.isFinite(state.rtt)?600+3*state.rtt:1500));
+  const start={trackId:selected.id,at:Math.round(roomNow()+state.skew+delay),timer:null};
+  state.hostStart=start;
+  audio.preload="auto";
+  publish();
+  updateButtons();
+  start.timer=setTimeout(()=>{
+    if(room!==state||!state.connected||state.hostStart!==start||selected?.id!==start.trackId)return;
+    state.hostStart=null;
+    requestPlay(true);
+    updateButtons();
+  },delay);
+}
 function connectRoom(state) {
   if(room!==state)return;
   const socket = new WebSocket(state.address);
@@ -568,10 +599,11 @@ function connectRoom(state) {
     state.loading=null;
     state.trackRequest++;
     clearTimeout(state.timer);
+    cancelHostStart(state);clearGuestStart(state);
     if (state.host === false) audio.pause();
     audio.playbackRate = rate;
     if(state.host===null||state.retries>=6){
-      room=null;
+      room=null;audio.preload="metadata";
       renderRoom(state.host===null?"Комната недоступна. Проверь код.":"Не удалось восстановить комнату. Войди по тому же коду.");
       return;
     }
@@ -596,7 +628,9 @@ function leaveRoom() {
   room = null;
   clearTimeout(old.timer);
   clearTimeout(old.retryTimer);
+  cancelHostStart(old);clearGuestStart(old);
   old.socket?.close();
+  audio.preload="metadata";
   audio.playbackRate = rate;
   renderRoom();
 }
@@ -606,11 +640,13 @@ function pingRoom() {
 function publish(paused=false) {
   if (!room?.host || !room.connected || room.socket.readyState !== WebSocket.OPEN) return;
   const direct = selected && selected.kind !== "youtube";
+  const sampled=Math.round(roomNow()+room.skew);
+  const pendingStart=!paused&&direct&&room.hostStart?.trackId===selected.id&&room.hostStart.at>=sampled-100?room.hostStart.at:null;
   room.socket.send(JSON.stringify({
     type:"playback",track_id:direct ? selected.id : null,
     position_ms:direct ? Math.round(Math.max(0,audio.currentTime || 0)*1000) : 0,
-    playing:Boolean(direct && !audio.paused && !audio.ended && !audio.seeking && audio.readyState>=3 && !paused),rate:audio.playbackRate,
-    sampled_at_ms:Math.round(roomNow()+room.skew)
+    playing:Boolean(pendingStart||direct&&!audio.paused&&!audio.ended&&!audio.seeking&&audio.readyState>=3&&!paused),rate:audio.playbackRate,
+    sampled_at_ms:sampled,start_at_ms:pendingStart
   }));
 }
 function publishSoon() {
@@ -621,6 +657,7 @@ function publishSoon() {
 }
 async function applyRemote(state,playback) {
   if (state.desired && playback.revision < state.desired.revision) return;
+  if(state.desired?.at_ms!==playback.at_ms||!playback.playing)clearGuestStart(state);
   state.desired = playback;
   if (!playback.track_id) {
     state.trackRequest++;
@@ -655,12 +692,20 @@ async function applyRemote(state,playback) {
 }
 function syncRoom() {
   if (!isGuest() || !room.connected || !room.desired || selected?.id !== room.desired.track_id) return;
-  const target = room.desired;
-  const position = (target.position_ms+(target.playing ? Math.max(0,roomNow()+room.skew-target.at_ms)*target.rate : 0))/1000;
+  const state=room,target=state.desired;
+  const now=roomNow()+state.skew;
+  const untilStart=target.playing?target.at_ms-now:0;
+  if(untilStart>0){
+    if(state.guestStartAt!==target.at_ms){
+      clearGuestStart(state);state.guestStartAt=target.at_ms;
+      state.guestStartTimer=setTimeout(()=>{if(room===state){clearGuestStart(state);syncRoom();}},untilStart);
+    }
+  }else clearGuestStart(state);
+  const position = (target.position_ms+(target.playing ? Math.max(0,now-target.at_ms)*target.rate : 0))/1000;
   if(!Number.isFinite(audio.duration)||audio.seeking)return;
   const next=Math.min(Math.max(0,position),audio.duration);
   const drift=next-audio.currentTime;
-  const shouldPlay=target.playing&&room.sound&&next<audio.duration;
+  const shouldPlay=target.playing&&untilStart<=0&&room.sound&&next<audio.duration;
   // Seek for discontinuities; gently correct small network and decoder drift.
   if(Math.abs(drift)>(shouldPlay&&!audio.paused ? .65 : .05))audio.currentTime=next;
   const correction=shouldPlay&&!audio.paused&&Math.abs(drift)>.035&&Math.abs(drift)<=.65
