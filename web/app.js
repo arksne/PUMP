@@ -190,6 +190,7 @@ function selectTrack(track, remote=false) {
   if(track.provider){track._providerRecovery=false;track._providerPosition=0;}
   if(canvasUrl){node("canvasVideo").pause();node("canvasVideo").removeAttribute("src");node("canvasVideo").hidden=true;URL.revokeObjectURL(canvasUrl);canvasUrl=null;}
   selected = track;
+  refreshLyricOffset();
   scrobbleState={started_at_unix:Math.floor(Date.now()/1000),played_ms:0,queued:false};
   node("streamTools").hidden=track.kind!=="youtube";
   known.set(track.id,track);
@@ -392,7 +393,7 @@ async function loadLyrics(track) {
   }
 }
 function syncLyrics(force=false) {
-  const t = audio.currentTime;
+  const t = audio.currentTime+lyricOffset()/1000;
   let lo=0,hi=lyricLines.length;
   while(lo<hi){const mid=(lo+hi)>>1;if(lyricLines[mid].time<=t)lo=mid+1;else hi=mid;}
   const next=lo-1;
@@ -718,7 +719,7 @@ document.addEventListener("click",event => {
     case "rate": if (!isGuest()) setRate(value,button); break;
     case "sleep": if (!isGuest()) toggleSleep(); break;
     case "lyric": if (!isGuest() && lyricLines[Number(value)] && Number.isFinite(audio.duration)) {
-      audio.currentTime = lyricLines[Number(value)].time;
+      audio.currentTime = Math.max(0,Math.min(audio.duration,lyricLines[Number(value)].time-lyricOffset()/1000));
       requestPlay();
     } break;
     case "create-room": createRoom(); break;
@@ -888,6 +889,36 @@ document.addEventListener("click",event=>{if(event.target.closest('[data-action=
 // Подсветка слов идёт только при видимом тексте и играющем аудио.
 // Слова кэшируются один раз при загрузке; каждый кадр трогает лишь окрестность текущей позиции.
 let lyricWords=[],lyricRaf=0;
+const savedLyricOffsets=stored("pump.lyricOffsets",[]);
+const lyricOffsets=new Map(Array.isArray(savedLyricOffsets)?savedLyricOffsets.filter(item=>Array.isArray(item)&&typeof item[0]==="string"&&Number.isFinite(item[1])&&Math.abs(item[1])<=10000).slice(-256):[]);
+const lyricOffsetControls=element("div","setting-row");
+const lyricOffsetLabel=element("span","","Смещение текста");
+const lyricOffsetValue=element("output","","0 мс");
+lyricOffsetValue.id="lyricOffsetValue";
+lyricOffsetValue.setAttribute("aria-live","polite");
+lyricOffsetControls.append(lyricOffsetLabel);
+for(const [id,label,delta] of [["lyricLater","−100 мс",-100],["lyricReset","Сброс",0],["lyricEarlier","+100 мс",100]]){
+  const button=element("button","",label);
+  button.id=id;button.type="button";
+  button.setAttribute("aria-label",id==="lyricLater"?"Текст позже на 100 мс":id==="lyricEarlier"?"Текст раньше на 100 мс":"Сбросить смещение текста");
+  button.addEventListener("click",()=>{
+    if(!selected)return;
+    const offset=delta===0?0:Math.max(-10000,Math.min(10000,lyricOffset()+delta));
+    lyricOffsets.delete(selected.id);
+    if(offset)lyricOffsets.set(selected.id,offset);
+    while(lyricOffsets.size>256)lyricOffsets.delete(lyricOffsets.keys().next().value);
+    persist("pump.lyricOffsets",Array.from(lyricOffsets));
+    refreshLyricOffset();syncLyrics(true);paintLyricWords();
+  });
+  lyricOffsetControls.append(button);
+}
+lyricOffsetControls.append(lyricOffsetValue);
+node("lyricsBox").before(lyricOffsetControls);
+function lyricOffset(){return selected?lyricOffsets.get(selected.id)||0:0;}
+function refreshLyricOffset(){
+  const offset=lyricOffset();
+  lyricOffsetValue.textContent=(offset>0?"+":"")+offset+" мс";
+}
 function lyricVisible(){return currentTab==="lyrics"||document.body.classList.contains("split-view");}
 function stopLyricAnim(){if(lyricRaf){cancelAnimationFrame(lyricRaf);lyricRaf=0;}}
 function refreshLyricAnim(){
@@ -897,7 +928,7 @@ function refreshLyricAnim(){
 // Independent intervals preserve overlapping singers. Cache each rendered state
 // so unchanged words do not cause DOM writes on every animation frame.
 function paintLyricWords(){
-  const time=audio.currentTime*1000;
+  const time=audio.currentTime*1000+lyricOffset();
   for(const word of lyricWords){
     const status=time<word.start?0:time<word.end?1:2;
     if(word.status===status)continue;
