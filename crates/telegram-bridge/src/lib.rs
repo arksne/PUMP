@@ -257,6 +257,7 @@ fn router(app: App) -> Router {
         )
         .route("/api/search", get(search))
         .route("/source/sc/{id}", get(source_sc))
+        .route("/source/au/{id}", get(source_au))
         .route("/api/nas", get(nas_api::list))
         .route("/api/nas/{id}/ticket", post(nas_api::ticket))
         .route("/nas/stream/{token}", get(nas_api::stream))
@@ -478,6 +479,7 @@ async fn stream(
 /// Параллельные потоки SoundCloud ограничены: каждый держит исходящее
 /// соединение до 120 с, без семафора скрипт перебора id положит сеть.
 static SC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+static AU_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// Один диапазон `bytes=start-end`, `bytes=start-` или `bytes=-suffix`.
 /// Мультидиапазоны отклоняются: плеер их не запрашивает.
@@ -573,9 +575,47 @@ async fn source_sc(
             Ok(Ok(upstream)) => upstream,
             _ => return ApiError::unavailable("SoundCloud недоступен.").into_response(),
         };
+    proxy_audio(upstream, permit)
+}
+
+async fn source_au(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if !core_streaming::audius::valid_id(&id) {
+        return ApiError::missing("Запись Audius не найдена.").into_response();
+    }
+    if !valid_range(request.headers().get(axum::http::header::RANGE)) {
+        return ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "Некорректный диапазон.")
+            .into_response();
+    }
+    let Ok(permit) = AU_SLOTS.try_acquire() else {
+        return ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Слишком много потоков. Повтори через несколько секунд.",
+        )
+        .into_response();
+    };
+    match app
+        .catalog
+        .audius_client()
+        .stream(&id, request.method().clone(), request.headers())
+        .await
+    {
+        Ok(upstream) => proxy_audio(upstream, permit),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn proxy_audio(
+    upstream: reqwest::Response,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) -> Response {
+    use axum::http::header;
     let status = upstream.status();
     if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
-        return ApiError::unavailable("SoundCloud недоступен.").into_response();
+        return ApiError::unavailable("Аудиоисточник недоступен.").into_response();
     }
     let mime = upstream
         .headers()
@@ -615,7 +655,7 @@ async fn source_sc(
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "простой потока SoundCloud",
+                            "простой аудиопотока",
                         )),
                         (inner, None),
                     ))
@@ -637,7 +677,7 @@ async fn source_sc(
         },
     ))) {
         Ok(response) => response.into_response(),
-        Err(_) => ApiError::unavailable("Некорректный ответ SoundCloud.").into_response(),
+        Err(_) => ApiError::unavailable("Некорректный ответ аудиоисточника.").into_response(),
     }
 }
 
