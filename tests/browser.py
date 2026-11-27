@@ -733,6 +733,31 @@ class PlayerTest(unittest.TestCase):
             guest_position = guest.locator("#audio").evaluate("(audio) => audio.currentTime")
             self.assertLess(abs(host_position - guest_position), 0.2)
 
+            # Resume announces a future server-clock anchor. Both peers
+            # prebuffer instead of immediately starting at message arrival.
+            guest.evaluate("""() => {
+                window.scheduledStartSeen = null;
+                room.socket.addEventListener("message", event => {
+                    const msg=JSON.parse(event.data);
+                    if(msg.type==="playback"&&msg.playback.playing&&msg.playback.at_ms>roomNow()+room.skew+100){
+                        window.scheduledStartSeen={paused:audio.paused,at:msg.playback.at_ms};
+                    }
+                });
+            }""")
+            host.locator("#playBtn").click()
+            guest.wait_for_function("() => window.scheduledStartSeen !== null",timeout=8000)
+            self.assertTrue(guest.evaluate("() => window.scheduledStartSeen.paused"))
+            wait_for_audio(host,"audio => !audio.paused")
+            wait_for_audio(guest,"audio => !audio.paused")
+            # Compare projected media positions rather than sequential reads.
+            # This is browser timeline evidence, not speaker-output latency.
+            time.sleep(0.7)
+            sample="audio => ({position:audio.currentTime,at:performance.timeOrigin+performance.now(),rate:audio.playbackRate})"
+            h=host.locator("#audio").evaluate(sample)
+            g=guest.locator("#audio").evaluate(sample)
+            projected=h["position"]+(g["at"]-h["at"])*h["rate"]/1000
+            self.assertLess(abs(projected-g["position"]),0.4)
+
             host.locator("#tabStats").click()
             expect(host.locator("#statsTracks")).to_contain_text("North Loop")
             host.locator("#statsPeriod").select_option("month")
