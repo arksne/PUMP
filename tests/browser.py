@@ -516,6 +516,10 @@ class PlayerTest(unittest.TestCase):
             self.assertEqual(page.locator(".lyric-word.current").inner_text(), "two")
             page.locator("#audio").evaluate("(audio) => { audio.currentTime = 3.5; return audio.play(); }")
             expect(page.locator(".lyric-word.current")).to_have_text("three", timeout=8000)
+            # Seeking backward while paused must clear stale sung classes.
+            page.locator("#audio").evaluate("(audio) => { audio.pause(); audio.currentTime = 1.5; }")
+            expect(page.locator(".lyric-word.current")).to_have_text("one")
+            self.assertEqual(page.locator(".lyric-word.sung").count(), 0)
             self.assertEqual(errors, [])
             browser.close()
 
@@ -564,6 +568,12 @@ class PlayerTest(unittest.TestCase):
             expect(guest.locator("#tTitle")).to_have_text("North Loop")
             wait_for_audio(guest, "audio => !audio.paused")
 
+            # Drop the live connection without leaving the room. The client
+            # should reconnect with the same sound consent and follow the host.
+            guest.evaluate("() => { window.previousRoomSocket = room.socket; room.socket.close(4000); }")
+            guest.wait_for_function("() => room?.connected && room.socket !== window.previousRoomSocket", timeout=12000)
+            wait_for_audio(guest, "audio => !audio.paused")
+            self.assertTrue(guest.evaluate("() => room.sound"))
             host.locator("#tabPlayer").click()
             host.locator("#seekBar").evaluate(
                 "(bar) => { bar.value = 50; bar.dispatchEvent(new Event('input', {bubbles: true})); }"
