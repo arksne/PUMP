@@ -286,6 +286,7 @@
           <option value="preview">Превью iTunes</option>
           <option value="youtube">YouTube</option>
           <option value="soundcloud">SoundCloud</option>
+          <option value="audius">Audius</option>
           <option value="spotify">Spotify</option>
           <option value="favorites">Избранное</option>
           <option value="history">История</option>
@@ -317,6 +318,16 @@
           <button class="btn chip" data-action="copy-room">Скопировать код</button>
           <button id="enableRoomSound" class="btn chip active" data-action="enable-room-sound" hidden>Включить звук</button>
           <button class="btn chip" data-action="leave-room">Выйти</button>
+        </div>
+        <div id="roomDiagnostics" hidden>
+          <p id="roomDiagnosticsText" class="status"></p>
+          <div id="roomOffsetControl" hidden>
+            <label class="setting-row">Коррекция звука слушателя <output id="roomOffsetValue" for="roomOffset">0 мс</output>
+              <input id="roomOffset" type="range" min="-500" max="500" step="10" value="0" />
+            </label>
+            <p class="status">Если слышишь звук позже ведущего, увеличь значение. RTT и отклонение позиции не измеряют задержку Bluetooth или динамика.</p>
+            <button id="roomOffsetReset" class="btn chip" type="button">Сбросить коррекцию</button>
+          </div>
         </div>
       </div>
     </section>
@@ -356,6 +367,9 @@
       </details>
       <details data-category="Воспроизведение скорость таймер сон sleep fade"><summary>Воспроизведение</summary>
         <label class="setting-row">Скорость <select id="rateSelect"><option value="0.85">0.85x Slowed</option><option value="1" selected>1.0x Норма</option><option value="1.15">1.15x Speed</option></select></label>
+        <label class="setting-row">Crossfade <select id="crossfadeSeconds"><option value="0" selected>Выкл.</option><option value="2">2 сек</option><option value="4">4 сек</option><option value="6">6 сек</option><option value="8">8 сек</option></select></label>
+        <label class="setting-row">Automix (локальные треки) <input id="automixEnabled" type="checkbox" /></label>
+        <p id="analysisStatus" class="status" role="status"></p>
         <label class="setting-row">Таймер сна <select id="sleepDuration"><option value="15">15 минут</option><option value="30">30 минут</option><option value="60">60 минут</option></select></label>
         <p class="status">Последние 15 секунд — плавное затухание прямого аудио. Для YouTube iframe таймер недоступен.</p>
         <button id="sleepBtn" class="btn chip" data-action="sleep">Таймер: выкл.</button>

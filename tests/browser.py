@@ -105,6 +105,65 @@ def soundcloud_stub(media, entries, client_id="a"*32):
     return ScHandler
 
 
+def audius_stub(media):
+    """Official API shape, public/gated metadata, redirect and byte ranges."""
+    def metadata(ident):
+        return {"id": ident, "title": "Audius Test " + ident, "user": {"name": "Fixture Artist"},
+                "duration": 40, "is_streamable": True, "is_stream_gated": ident == "Gated1"}
+    class Handler(BaseHTTPRequestHandler):
+        def payload(self, data):
+            body=json.dumps({"data":data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            path=self.path.split("?")[0]
+            if path=="/v1/tracks/search":
+                self.payload([metadata("Public1"),metadata("Gated1")])
+            elif path in ("/v1/tracks/Public1","/v1/tracks/Gated1","/v1/tracks/Unsafe1"):
+                self.payload(metadata(path.rsplit("/",1)[1]))
+            elif path=="/v1/tracks/Public1/stream":
+                if "preview=false" not in self.path:
+                    self.send_error(400)
+                    return
+                self.send_response(302)
+                self.send_header("Location","/cdn/public.mp3")
+                self.end_headers()
+            elif path=="/v1/tracks/Unsafe1/stream":
+                self.send_response(302)
+                self.send_header("Location","http://127.0.0.1:1/private")
+                self.end_headers()
+            elif path=="/cdn/public.mp3":
+                start,end=0,len(media)-1
+                value=self.headers.get("Range")
+                if value:
+                    found=re.fullmatch(r"bytes=(\d+)-(\d*)",value)
+                    if not found:
+                        self.send_error(416)
+                        return
+                    start=int(found[1]);end=min(int(found[2]) if found[2] else end,end)
+                    if start>end:
+                        self.send_response(416)
+                        self.send_header("Content-Range",f"bytes */{len(media)}")
+                        self.end_headers()
+                        return
+                self.send_response(206 if value else 200)
+                self.send_header("Content-Type","audio/mpeg")
+                self.send_header("Content-Length",str(end-start+1))
+                self.send_header("Accept-Ranges","bytes")
+                if value:
+                    self.send_header("Content-Range",f"bytes {start}-{end}/{len(media)}")
+                self.end_headers()
+                self.wfile.write(media[start:end+1])
+            else:
+                self.send_error(404)
+        def log_message(self,*args):
+            pass
+    return Handler
+
+
 class PlayerTest(unittest.TestCase):
     def setUp(self):
         self.folder = TemporaryDirectory(prefix="pump-browser-")
@@ -156,12 +215,12 @@ class PlayerTest(unittest.TestCase):
                 self.server.kill()
                 self.server.wait(timeout=5)
 
-    def request(self, path, *, body=None, headers=None):
+    def request(self, path, *, body=None, headers=None, timeout=12):
         headers = dict(headers or {})
         if body is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(body).encode()
-        with urlopen(Request(self.origin + path, data=body, headers=headers), timeout=12) as response:
+        with urlopen(Request(self.origin + path, data=body, headers=headers), timeout=timeout) as response:
             return response.status, response.headers, response.read()
 
     def test_catalog_and_persistent_statistics(self):
@@ -192,6 +251,51 @@ class PlayerTest(unittest.TestCase):
         self.assertEqual((stats["tracks"], stats["milliseconds"]), (1, 1200))
         self.assertEqual(stats["top_artists"][0]["title"], track["artist"])
 
+    def test_audius_public_search_stream_range_and_gates(self):
+        media=(self.root/"music/alpha.mp3").read_bytes()
+        stub=ThreadingHTTPServer(("127.0.0.1",0),audius_stub(media))
+        threading.Thread(target=stub.serve_forever,daemon=True).start()
+        self.addCleanup(stub.server_close)
+        self.addCleanup(stub.shutdown)
+        self.stop()
+        self.environment["PUMP_AUDIUS_TEST_API_BASE"]=f"http://127.0.0.1:{stub.server_port}/v1"
+        self.start()
+        _,_,data=self.request("/api/search?source=audius&q=Fixture")
+        tracks=json.loads(data)["tracks"]
+        self.assertEqual([t["id"] for t in tracks],["au-Public1"])
+        self.assertEqual((tracks[0]["source"],tracks[0]["kind"],tracks[0]["duration_ms"]),("Audius","full",40000))
+        status,headers,part=self.request(tracks[0]["audio_url"],headers={"Range":"bytes=100-199"})
+        self.assertEqual((status,part),(206,media[100:200]))
+        self.assertEqual(headers["Content-Range"],f"bytes 100-199/{len(media)}")
+        with self.assertRaises(HTTPError) as gated:
+            self.request("/source/au/Gated1")
+        self.assertEqual(gated.exception.code,409)
+        with self.assertRaises(HTTPError) as unsafe:
+            self.request("/source/au/Unsafe1")
+        self.assertEqual(unsafe.exception.code,502)
+        with self.assertRaises(HTTPError) as invalid:
+            self.request("/source/au/Public1",headers={"Range":"bytes=0-1,4-5"})
+        self.assertEqual(invalid.exception.code,416)
+        _,_,metadata=self.request("/api/tracks/au-Public1")
+        self.assertEqual(json.loads(metadata)["id"],"au-Public1")
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("audius")
+            page.locator("#qInput").fill("Fixture")
+            page.get_by_role("button",name="Audius Test Public1",exact=False).click()
+            wait_for_audio(page,"audio => !audio.paused && audio.currentTime > 0.5")
+            page.locator("#seekBar").evaluate("(bar) => { bar.value = 50; bar.dispatchEvent(new Event('input', {bubbles: true})); }")
+            wait_for_audio(page,"audio => audio.currentTime >= 19.5")
+            self.assertEqual(errors,[])
+            browser.close()
+
     def test_external_sources_shape_and_guards(self):
         _, _, data = self.request("/api/search?source=spotify&q=North")
         body = json.loads(data)
@@ -213,6 +317,8 @@ class PlayerTest(unittest.TestCase):
         body = json.loads(data)
         tracks = [t for t in body["tracks"] if t["kind"] == "full"]
         if not tracks and body.get("notice") and "недоступен" in body["notice"]:
+            if os.environ.get("PUMP_REQUIRE_SOUNDCLOUD_LIVE") == "1":
+                self.fail("SoundCloud недоступен из этой сети (live-проверка обязательна)")
             self.skipTest("SoundCloud недоступен из этой сети")
         return tracks
 
@@ -231,6 +337,13 @@ class PlayerTest(unittest.TestCase):
         _,_,data=self.request("/api/search?source=soundcloud&q=Stub")
         found={t["id"]:t for t in json.loads(data)["tracks"]}
         self.assertEqual(set(found),{"sc-424242","sc-434343"})
+        # The default search must expose full remote recordings, not just previews.
+        _,_,combined=self.request("/api/search?source=all&q=Stub")
+        combined_tracks=json.loads(combined)["tracks"]
+        self.assertTrue(any(t["id"]=="sc-424242" and t["kind"]=="full" for t in combined_tracks))
+        ids=[t["id"] for t in combined_tracks]
+        self.assertEqual(len(ids),len(set(ids)))
+        self.assertEqual(ids.count("sc-424242"),1)
         track=found["sc-424242"]
         self.assertEqual((track["title"],track["source"]),("Stub Loop","SoundCloud"))
         self.assertEqual(track["audio_url"],"/source/sc/424242")
@@ -480,6 +593,47 @@ class PlayerTest(unittest.TestCase):
             self.assertEqual(errors,[])
             browser.close()
 
+    def test_local_analysis_and_two_deck_crossfade(self):
+        _,_,data=self.request("/api/search?source=full&q=North")
+        track=json.loads(data)["tracks"][0]
+        _,_,session=self.request("/api/session",body={})
+        auth={"Authorization":"Bearer "+json.loads(session)["token"]}
+        with self.assertRaises(HTTPError) as unauthorized:
+            self.request("/api/analysis/"+track["id"])
+        self.assertEqual(unauthorized.exception.code,401)
+        _,_,body=self.request("/api/analysis/"+track["id"],headers=auth,timeout=60)
+        features=json.loads(body)
+        self.assertGreater(features["duration_seconds"],39)
+        self.assertGreater(features["true_peak"],0)
+        self.assertIn("integrated_lufs",features)
+        _,_,cached=self.request("/api/analysis/"+track["id"],headers=auth)
+        self.assertEqual(json.loads(cached),features)
+        with self.assertRaises(HTTPError) as external:
+            self.request("/api/analysis/au-Public1",headers=auth)
+        self.assertEqual(external.exception.code,404)
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            page.add_init_script("localStorage.setItem('pump.crossfadeSeconds','4')")
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("full")
+            page.locator("#qInput").fill("Loop")
+            page.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(page,"audio => audio.currentTime > 0.6")
+            page.evaluate("() => { window.firstDeck=audio; audio.currentTime=34; }")
+            page.wait_for_function("() => transition?.phase==='fading'",timeout=10000)
+            self.assertTrue(page.evaluate("() => !transition.from.paused && !transition.to.paused"))
+            expect(page.locator("#tTitle")).to_have_text("South Loop",timeout=10000)
+            self.assertTrue(page.evaluate("() => audio!==window.firstDeck && window.firstDeck.paused"))
+            wait_for_audio(page,"audio => !audio.paused && audio.currentTime > 0.5 && audio.currentTime < 12")
+            self.assertEqual(errors,[])
+            browser.close()
+
     def test_lyrics_word_highlight_tick_and_pause(self):
         doc = {"format": "enhanced_lrc",
                "lines": [{"text": "one two", "start_ms": 1000, "end_ms": 3000,
@@ -512,7 +666,52 @@ class PlayerTest(unittest.TestCase):
             self.assertEqual(page.locator(".lyric-word.current").inner_text(), "two")
             page.locator("#audio").evaluate("(audio) => { audio.currentTime = 3.5; return audio.play(); }")
             expect(page.locator(".lyric-word.current")).to_have_text("three", timeout=8000)
+            # Seeking backward while paused must clear stale sung classes.
+            page.locator("#audio").evaluate("(audio) => { audio.pause(); audio.currentTime = 1.5; }")
+            expect(page.locator(".lyric-word.current")).to_have_text("one")
+            self.assertEqual(page.locator(".lyric-word.sung").count(), 0)
+            for _ in range(6):
+                page.locator("#lyricEarlier").click()
+            expect(page.locator("#lyricOffsetValue")).to_have_text("+600 мс")
+            expect(page.locator(".lyric-word.current")).to_have_text("two")
+            self.assertEqual(page.evaluate("() => JSON.parse(localStorage.getItem('pump.lyricOffsets'))[0][1]"),600)
+            page.locator("#lyricReset").click()
+            expect(page.locator(".lyric-word.current")).to_have_text("one")
             self.assertEqual(errors, [])
+            browser.close()
+
+    def test_lyrics_overlapping_vocals_and_gaps(self):
+        doc={"format":"ttml","lines":[
+            {"text":"lead","start_ms":1000,"end_ms":4000,
+             "words":[{"text":"lead","start_ms":1000,"end_ms":4000}],"singer_ids":["lead"],"alignment":"left"},
+            {"text":"harmony","start_ms":2000,"end_ms":3000,
+             "words":[{"text":"harmony","start_ms":2000,"end_ms":3000}],"singer_ids":["harmony"],"alignment":"right"},
+            {"text":"outro","start_ms":6000,"end_ms":8000,
+             "words":[{"text":"outro","start_ms":6000,"end_ms":8000}],"singer_ids":["lead"],"alignment":"left"}]}
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"plain":None,"document":doc}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("full")
+            page.locator("#qInput").fill("North")
+            page.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(page,"audio => audio.currentTime > 0.6")
+            page.locator("#tabLyrics").click()
+            page.locator("#audio").evaluate("(audio) => { audio.pause(); audio.currentTime=2.5; }")
+            expect(page.locator(".l-line.active")).to_have_count(2)
+            expect(page.locator(".lyric-word.current")).to_have_count(2)
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime=5; }")
+            expect(page.locator(".l-line.active")).to_have_count(0)
+            expect(page.locator(".lyric-word.current")).to_have_count(0)
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime=1.5; }")
+            expect(page.locator(".lyric-word.current")).to_have_text("lead")
+            expect(page.locator(".lyric-word.sung")).to_have_count(0)
+            self.assertEqual(errors,[])
             browser.close()
 
     def test_two_people_listen_together(self):
@@ -560,6 +759,12 @@ class PlayerTest(unittest.TestCase):
             expect(guest.locator("#tTitle")).to_have_text("North Loop")
             wait_for_audio(guest, "audio => !audio.paused")
 
+            # Drop the live connection without leaving the room. The client
+            # should reconnect with the same sound consent and follow the host.
+            guest.evaluate("() => { window.previousRoomSocket = room.socket; room.socket.close(4000); }")
+            guest.wait_for_function("() => room?.connected && room.socket !== window.previousRoomSocket", timeout=12000)
+            wait_for_audio(guest, "audio => !audio.paused")
+            self.assertTrue(guest.evaluate("() => room.sound"))
             host.locator("#tabPlayer").click()
             host.locator("#seekBar").evaluate(
                 "(bar) => { bar.value = 50; bar.dispatchEvent(new Event('input', {bubbles: true})); }"
@@ -571,11 +776,104 @@ class PlayerTest(unittest.TestCase):
             guest_position = guest.locator("#audio").evaluate("(audio) => audio.currentTime")
             self.assertLess(abs(host_position - guest_position), 0.2)
 
+            # Resume announces a future server-clock anchor. Both peers
+            # prebuffer instead of immediately starting at message arrival.
+            guest.evaluate("""() => {
+                window.scheduledStartSeen = null;
+                room.socket.addEventListener("message", event => {
+                    const msg=JSON.parse(event.data);
+                    if(msg.type==="playback"&&msg.playback.playing&&msg.playback.at_ms>roomNow()+room.skew+100){
+                        window.scheduledStartSeen={paused:audio.paused,at:msg.playback.at_ms};
+                    }
+                });
+            }""")
+            host.locator("#playBtn").click()
+            guest.wait_for_function("() => window.scheduledStartSeen !== null",timeout=8000)
+            self.assertTrue(guest.evaluate("() => window.scheduledStartSeen.paused"))
+            wait_for_audio(host,"audio => !audio.paused")
+            wait_for_audio(guest,"audio => !audio.paused")
+            # Compare projected media positions rather than sequential reads.
+            # This is browser timeline evidence, not speaker-output latency.
+            time.sleep(0.7)
+            sample="audio => ({position:audio.currentTime,at:performance.timeOrigin+performance.now(),rate:audio.playbackRate})"
+            h=host.locator("#audio").evaluate(sample)
+            g=guest.locator("#audio").evaluate(sample)
+            projected=h["position"]+(g["at"]-h["at"])*h["rate"]/1000
+            self.assertLess(abs(projected-g["position"]),0.4)
+
             host.locator("#tabStats").click()
             expect(host.locator("#statsTracks")).to_contain_text("North Loop")
             host.locator("#statsPeriod").select_option("month")
             expect(host.locator("#statsArtists")).to_contain_text("PUMP Test Artist")
             self.assertEqual(errors, [])
+            browser.close()
+
+    def test_room_delayed_and_dropped_control_messages(self):
+        """Delay and drop inbound room updates, not audio sample clocks."""
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            device=driver.devices["Pixel 7"]
+            host=browser.new_context(**device).new_page()
+            guest=browser.new_context(**device).new_page()
+            guest.add_init_script("""(() => {
+                const Native=window.WebSocket;
+                window.roomDelayed=0; window.roomDropped=0;
+                window.WebSocket=class extends Native {
+                    addEventListener(type, callback, options){
+                        if(type!=="message"||!this.url.includes("/ws/room/"))
+                            return super.addEventListener(type,callback,options);
+                        return super.addEventListener(type,event=>{
+                            const message=JSON.parse(event.data);
+                            if(message.type!=="playback")return callback.call(this,event);
+                            const n=++window.roomDelayed;
+                            if(n%5===0){window.roomDropped++;return;}
+                            setTimeout(()=>callback.call(this,event),[180,40,260,80][n%4]);
+                        },options);
+                    }
+                };
+            })()""")
+            errors=[]
+            for page in (host,guest):
+                page.on("pageerror",lambda error:errors.append(str(error)))
+                page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+                page.goto(self.origin)
+            host.locator("#tabSearch").click()
+            host.locator("#source").select_option("full")
+            host.locator("#qInput").fill("North")
+            host.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(host,"audio => audio.currentTime > 0.5")
+            host.locator("#tabRooms").click()
+            host.locator("#createRoom").click()
+            expect(host.locator("#roomStatus")).to_contain_text("Ведущий")
+            guest.locator("#tabRooms").click()
+            guest.locator("#roomCode").fill(host.locator("#roomCode").input_value())
+            guest.get_by_role("button",name="Войти",exact=True).click()
+            expect(guest.locator("#roomStatus")).to_contain_text("Слушатель")
+            guest.locator("#enableRoomSound").click()
+            wait_for_audio(guest,"audio => !audio.paused && audio.currentTime > 0.5")
+            expect(guest.locator("#roomDiagnosticsText")).to_contain_text("RTT:")
+            guest.locator("#roomOffset").evaluate("(input) => { input.value=200; input.dispatchEvent(new Event('input')); }")
+            expect(guest.locator("#roomOffsetValue")).to_have_text("+200 мс")
+            self.assertEqual(guest.evaluate("() => JSON.parse(localStorage.getItem('pump.roomOffsetMs'))"),200)
+            guest.locator("#roomOffsetReset").click()
+            expect(guest.locator("#roomOffsetValue")).to_have_text("0 мс")
+            host.locator("#tabPlayer").click()
+            host.locator("#seekBar").evaluate("(bar) => { bar.value=50; bar.dispatchEvent(new Event('input',{bubbles:true})); }")
+            wait_for_audio(guest,"audio => audio.currentTime >= 19.5")
+            guest.wait_for_function("() => window.roomDropped>=1",timeout=10000)
+            host.locator("#playBtn").click()
+            wait_for_audio(guest,"audio => audio.paused")
+            guest.wait_for_function("() => !room.desired.playing && Math.abs(room.desired.position_ms/1000-audio.currentTime)<0.06")
+            h=host.locator("#audio").evaluate("(audio)=>audio.currentTime")
+            g=guest.locator("#audio").evaluate("(audio)=>audio.currentTime")
+            self.assertLess(abs(h-g),0.15)
+            host.locator("#playBtn").click()
+            wait_for_audio(host,"audio => !audio.paused")
+            wait_for_audio(guest,"audio => !audio.paused")
+            guest.wait_for_function("() => Math.abs(roomTargetPosition(room.desired,roomNow()+room.skew)-audio.currentTime)<0.35",timeout=10000)
+            self.assertGreaterEqual(guest.evaluate("() => window.roomDelayed"),5)
+            self.assertEqual(errors,[])
             browser.close()
 
     def test_soundcloud_playback_range_seek_and_refresh(self):

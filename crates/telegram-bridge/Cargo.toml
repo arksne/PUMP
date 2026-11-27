@@ -34,7 +34,7 @@ core-streaming = { path = "../core-streaming" }
 library-storage = { path = "../library-storage" }
 lyrics-engine = { path = "../lyrics-engine" }
 ui-liquid-glass = { path = "../ui-liquid-glass" }
-audio-dsp-engine = { path = "../audio-dsp-engine", default-features = false }
+audio-dsp-engine = { path = "../audio-dsp-engine", default-features = false, features = ["decode", "analysis"] }
 plugin-spine = { path = "../plugin-spine" }
 social-integrations = { path = "../social-integrations" }
 async-trait = "0.1"

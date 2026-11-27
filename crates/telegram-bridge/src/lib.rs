@@ -2,6 +2,7 @@
 
 use core_streaming as catalog;
 use core_streaming::ApiError;
+mod analysis_api;
 mod cards;
 mod controls;
 mod imports;
@@ -35,6 +36,7 @@ pub(crate) const MAX_TRACK_MS: u64 = 24 * 60 * 60 * 1000;
 #[derive(Clone)]
 pub(crate) struct App {
     catalog: Arc<Catalog>,
+    analysis: analysis_api::AnalysisCache,
     http: reqwest::Client,
     stats: stats::Store,
     rooms: rooms::Rooms,
@@ -137,6 +139,7 @@ pub async fn run() -> Result<()> {
         imports: imports::Imports::default(),
         scrobbles: scrobbling::Scrobbles::new(data.join("lastfm")),
         catalog,
+        analysis: analysis_api::AnalysisCache::default(),
         stats,
         rooms: rooms::Rooms::default(),
         controls: controls::Controls::default(),
@@ -256,7 +259,9 @@ fn router(app: App) -> Router {
             }),
         )
         .route("/api/search", get(search))
+        .route("/api/analysis/{id}", get(analysis_api::track))
         .route("/source/sc/{id}", get(source_sc))
+        .route("/source/au/{id}", get(source_au))
         .route("/api/nas", get(nas_api::list))
         .route("/api/nas/{id}/ticket", post(nas_api::ticket))
         .route("/nas/stream/{token}", get(nas_api::stream))
@@ -342,49 +347,38 @@ async fn search(
         let result = app.catalog.search(query).await?;
         return Ok(Json(result));
     }
-    // Общий поиск: локальный каталог, превью, YouTube и SoundCloud идут
-    // параллельно с пределом времени; Spotify добавляется совпадающим.
+    // Catalog::All already queries all public providers in parallel.
+    // Spotify only contributes matched records, not a second audio stream.
     let term = query.q.clone();
-    let (base, sc) = tokio::join!(
-        app.catalog.search(SearchQuery {
-            q: term.clone(),
-            source: catalog::Source::All,
-        }),
-        tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            app.catalog.search(SearchQuery {
-                q: term.clone(),
-                source: catalog::Source::Soundcloud,
-            })
-        )
-    );
+    let spotify = async {
+        if app.spotify_app.is_some() {
+            Some(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    spotify_matched(&app, &term),
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    };
+    let (base, found) = tokio::join!(app.catalog.search(query), spotify);
     let mut result = base?;
     let mut notices: Vec<String> = result.notice.take().into_iter().collect();
-    match sc {
-        Ok(Ok(mut remote)) => {
-            result.tracks.append(&mut remote.tracks);
-            notices.extend(remote.notice);
+    match found {
+        Some(Ok((mut tracks, total))) => {
+            let shown = tracks.len();
+            result.tracks.append(&mut tracks);
+            notices.push(format!(
+                "Spotify: показаны совпадения с каталогом PUMP: {shown} из {total}."
+            ));
         }
-        Ok(Err(_)) => notices.push("SoundCloud недоступен. Его можно выбрать отдельно.".into()),
-        Err(_) => notices.push("SoundCloud не ответил вовремя. Его можно выбрать отдельно.".into()),
+        Some(Err(_)) => notices.push("Spotify не ответил вовремя.".into()),
+        None => {}
     }
-    if app.spotify_app.is_some() {
-        let found = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            spotify_matched(&app, &term),
-        )
-        .await;
-        match found {
-            Ok((mut tracks, total)) => {
-                let shown = tracks.len();
-                result.tracks.append(&mut tracks);
-                notices.push(format!(
-                    "Spotify: показаны совпадения с каталогом PUMP: {shown} из {total}."
-                ));
-            }
-            Err(_) => notices.push("Spotify не ответил вовремя.".into()),
-        }
-    }
+    let mut seen = std::collections::HashSet::new();
+    result.tracks.retain(|track| seen.insert(track.id.clone()));
     result
         .tracks
         .sort_by_key(|track| track.kind != catalog::Kind::Full);
@@ -489,6 +483,7 @@ async fn stream(
 /// Параллельные потоки SoundCloud ограничены: каждый держит исходящее
 /// соединение до 120 с, без семафора скрипт перебора id положит сеть.
 static SC_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+static AU_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// Один диапазон `bytes=start-end`, `bytes=start-` или `bytes=-suffix`.
 /// Мультидиапазоны отклоняются: плеер их не запрашивает.
@@ -568,7 +563,10 @@ async fn source_sc(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let mut upstream_request = app.http.request(request.method().clone(), &stream.url);
+    let mut upstream_request = app
+        .http
+        .request(request.method().clone(), &stream.url)
+        .timeout(std::time::Duration::from_secs(24 * 60 * 60));
     if let Some(range) = request.headers().get(header::RANGE) {
         upstream_request = upstream_request.header(header::RANGE, range);
     }
@@ -581,9 +579,47 @@ async fn source_sc(
             Ok(Ok(upstream)) => upstream,
             _ => return ApiError::unavailable("SoundCloud недоступен.").into_response(),
         };
+    proxy_audio(upstream, permit)
+}
+
+async fn source_au(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if !core_streaming::audius::valid_id(&id) {
+        return ApiError::missing("Запись Audius не найдена.").into_response();
+    }
+    if !valid_range(request.headers().get(axum::http::header::RANGE)) {
+        return ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "Некорректный диапазон.")
+            .into_response();
+    }
+    let Ok(permit) = AU_SLOTS.try_acquire() else {
+        return ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Слишком много потоков. Повтори через несколько секунд.",
+        )
+        .into_response();
+    };
+    match app
+        .catalog
+        .audius_client()
+        .stream(&id, request.method().clone(), request.headers())
+        .await
+    {
+        Ok(upstream) => proxy_audio(upstream, permit),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn proxy_audio(
+    upstream: reqwest::Response,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) -> Response {
+    use axum::http::header;
     let status = upstream.status();
     if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
-        return ApiError::unavailable("SoundCloud недоступен.").into_response();
+        return ApiError::unavailable("Аудиоисточник недоступен.").into_response();
     }
     let mime = upstream
         .headers()
@@ -611,6 +647,7 @@ async fn source_sc(
     match response.body(axum::body::Body::from_stream(futures_util::stream::unfold(
         (upstream.bytes_stream(), Some(permit)),
         |(mut inner, permit)| async move {
+            let permit = permit?;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 futures_util::StreamExt::next(&mut inner),
@@ -622,7 +659,7 @@ async fn source_sc(
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "простой потока NAS",
+                            "простой аудиопотока",
                         )),
                         (inner, None),
                     ))
@@ -637,14 +674,14 @@ async fn source_sc(
                         drop(permit);
                         Some((item, (inner, None)))
                     } else {
-                        Some((item, (inner, permit)))
+                        Some((item, (inner, Some(permit))))
                     }
                 }
             }
         },
     ))) {
         Ok(response) => response.into_response(),
-        Err(_) => ApiError::unavailable("Некорректный ответ SoundCloud.").into_response(),
+        Err(_) => ApiError::unavailable("Некорректный ответ аудиоисточника.").into_response(),
     }
 }
 

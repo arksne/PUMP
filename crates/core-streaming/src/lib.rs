@@ -1,6 +1,7 @@
 //! Поиск по файлам, полным демотрекам, превью iTunes и каталогу YouTube.
 //! Тип источника хранится отдельно. Клиент не принимает превью за полную запись.
 
+pub mod audius;
 mod error;
 pub mod innertube;
 pub mod network;
@@ -26,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use url::Url;
 
 // Обложки сохранены из исходного прототипа, чтобы не зависеть от доступа браузера к CDN.
@@ -91,6 +92,7 @@ pub enum Source {
     Preview,
     Youtube,
     Soundcloud,
+    Audius,
     Spotify,
 }
 
@@ -114,6 +116,9 @@ pub struct Lyrics {
     plain: Option<String>,
 }
 
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(180);
+static REMOTE_SEARCH_SLOTS: Semaphore = Semaphore::const_new(24);
+static REMOTE_LOOKUP_SLOTS: Semaphore = Semaphore::const_new(16);
 type SearchCache = HashMap<(u8, String), (Instant, Vec<Track>)>;
 type LookupCache = HashMap<String, (Instant, Track)>;
 
@@ -125,6 +130,7 @@ pub struct Catalog {
     youtube_key: Option<String>,
     auth: Option<innertube::SessionAuth>,
     soundcloud: soundcloud::SoundCloudClient,
+    audius: audius::AudiusClient,
     streams: RwLock<HashMap<String, innertube::Streams>>,
     queries: RwLock<SearchCache>,
     lookup: RwLock<LookupCache>,
@@ -164,6 +170,7 @@ impl Catalog {
             http: http.clone(),
             youtube_key,
             auth: None,
+            audius: audius::AudiusClient::from_env(http.clone()),
             soundcloud: soundcloud::SoundCloudClient::from_env(http),
             streams: RwLock::default(),
             queries: RwLock::default(),
@@ -419,7 +426,14 @@ impl Catalog {
         if let Some(video) = id.strip_prefix("yt-").filter(|id| valid_video(id)) {
             return Some(youtube_track(video, "Видео YouTube", ""));
         }
+        if let Some(audius_id) = id.strip_prefix("au-").filter(|id| audius::valid_id(id)) {
+            let _permit = REMOTE_LOOKUP_SLOTS.try_acquire().ok()?;
+            let track = self.audius.track(audius_id).await.ok()?;
+            let _ = self.register_track(track.clone()).await;
+            return Some(track);
+        }
         if let Some(numeric) = id.strip_prefix("sc-").filter(|n| soundcloud::valid_id(n)) {
+            let _permit = REMOTE_LOOKUP_SLOTS.try_acquire().ok()?;
             // Комнаты и статистика принимают трек без предварительного поиска:
             // метаданные подтягиваются с источника и живут в lookup-кэше 6 часов.
             if let Ok(meta) = self.soundcloud.track(numeric).await
@@ -460,13 +474,38 @@ impl Catalog {
             );
         }
         let mut notice = None;
-        if !term.is_empty() {
+        if !term.is_empty() && matches!(query.source, Source::All) {
+            // Providers fail independently; a preview must not hide full recordings.
+            let deadline = Duration::from_secs(4);
+            let (soundcloud, audius, youtube, preview) = tokio::join!(
+                tokio::time::timeout(deadline, self.remote(Source::Soundcloud, term)),
+                tokio::time::timeout(deadline, self.remote(Source::Audius, term)),
+                tokio::time::timeout(deadline, self.remote(Source::Youtube, term)),
+                tokio::time::timeout(deadline, self.remote(Source::Preview, term)),
+            );
+            let mut failed = Vec::new();
+            for (name, result) in [
+                ("SoundCloud", soundcloud),
+                ("Audius", audius),
+                ("YouTube", youtube),
+                ("iTunes", preview),
+            ] {
+                match result {
+                    Ok(Ok(mut results)) => tracks.append(&mut results),
+                    _ => failed.push(name),
+                }
+            }
+            if !failed.is_empty() {
+                notice = Some(format!("Источники недоступны: {}.", failed.join(", ")));
+            }
+        } else if !term.is_empty() {
             let remote = match query.source {
                 Source::Youtube => Some((
                     Source::Youtube,
                     "YouTube сейчас недоступен. Можно открыть видео по ссылке.",
                 )),
                 Source::Soundcloud => Some((Source::Soundcloud, "SoundCloud сейчас недоступен.")),
+                Source::Audius => Some((Source::Audius, "Audius сейчас недоступен.")),
                 Source::All | Source::Preview => {
                     Some((Source::Preview, "Каталог превью сейчас недоступен."))
                 }
@@ -481,7 +520,7 @@ impl Catalog {
             }
         } else if matches!(
             query.source,
-            Source::Preview | Source::Youtube | Source::Soundcloud
+            Source::Preview | Source::Youtube | Source::Soundcloud | Source::Audius
         ) {
             notice = Some("Введи название или имя артиста.".into());
         }
@@ -493,6 +532,7 @@ impl Catalog {
             match source {
                 Source::Youtube => 1,
                 Source::Soundcloud => 2,
+                Source::Audius => 3,
                 _ => 0,
             },
             term.to_lowercase(),
@@ -502,19 +542,23 @@ impl Catalog {
             .read()
             .await
             .get(&key)
-            .filter(|(inserted, _)| inserted.elapsed() < Duration::from_secs(180))
+            .filter(|(inserted, _)| inserted.elapsed() < SEARCH_CACHE_TTL)
             .map(|(_, results)| results.clone())
         {
             return Ok(result);
         }
+        let _permit = REMOTE_SEARCH_SLOTS
+            .try_acquire()
+            .map_err(|_| Some("Поиск занят. Повтори через несколько секунд."))?;
         let tracks = match source {
             Source::Youtube => self.youtube(term).await.map_err(|_| None)?,
             Source::Soundcloud => self.soundcloud_search(term).await?,
+            Source::Audius => self.audius.search(term).await.map_err(|_| None)?,
             _ => self.preview(term).await.map_err(|_| None)?,
         };
         let now = Instant::now();
         let mut cache = self.queries.write().await;
-        cache.retain(|_, (inserted, _)| inserted.elapsed() < Duration::from_secs(180));
+        cache.retain(|_, (inserted, _)| inserted.elapsed() < SEARCH_CACHE_TTL);
         if cache.len() >= 256 {
             cache.clear();
         }
@@ -632,6 +676,10 @@ impl Catalog {
         let mut tracks = Vec::new();
         parse_innertube(&data, &mut tracks);
         Ok(tracks)
+    }
+
+    pub fn audius_client(&self) -> &audius::AudiusClient {
+        &self.audius
     }
 
     pub fn soundcloud_client(&self) -> &soundcloud::SoundCloudClient {

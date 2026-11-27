@@ -23,10 +23,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Semaphore, broadcast};
 use uuid::Uuid;
 
 const LIFETIME: u64 = 6 * 60 * 60 * 1000;
+static CONNECTIONS: Semaphore = Semaphore::const_new(512);
 
 #[derive(Clone, Default)]
 pub(crate) struct Rooms(Arc<Mutex<HashMap<String, Arc<Room>>>>);
@@ -36,6 +37,7 @@ struct Room {
     state: Mutex<Playback>,
     activity: AtomicU64,
     hosts: AtomicUsize,
+    peers: Arc<Semaphore>,
     updates: broadcast::Sender<Playback>,
 }
 
@@ -63,6 +65,10 @@ enum Input {
         position_ms: u64,
         playing: bool,
         rate: f64,
+        #[serde(default)]
+        sampled_at_ms: Option<u64>,
+        #[serde(default)]
+        start_at_ms: Option<u64>,
     },
 }
 
@@ -121,6 +127,7 @@ pub(crate) async fn create(
             }),
             activity: AtomicU64::new(now),
             hosts: AtomicUsize::new(0),
+            peers: Arc::new(Semaphore::new(32)),
             updates,
         }),
     );
@@ -165,10 +172,22 @@ pub(crate) async fn upgrade(
         .cloned()
         .filter(|room| now_ms().saturating_sub(room.activity.load(Ordering::Relaxed)) < LIFETIME)
         .ok_or_else(|| ApiError::missing("Комната не найдена."))?;
+    let global = CONNECTIONS
+        .try_acquire()
+        .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Сервер комнат занят."))?;
+    let peer = room.peers.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "В комнате нет свободных мест.",
+        )
+    })?;
     Ok(ws
         .max_message_size(4096)
         .max_frame_size(4096)
-        .on_upgrade(move |socket| serve(socket, app, room)))
+        .on_upgrade(move |socket| async move {
+            let (_global, _peer) = (global, peer);
+            serve(socket, app, room).await;
+        }))
 }
 
 async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
@@ -233,7 +252,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                     Ok(Input::Ping { sent_ms }) => {
                         if !send(&mut socket, Output::Pong { sent_ms, server_ms: now }).await { break; }
                     }
-                    Ok(Input::Playback { track_id, position_ms, playing, rate }) => {
+                    Ok(Input::Playback { track_id, position_ms, playing, rate, sampled_at_ms, start_at_ms }) => {
                         if !host {
                             if !send(&mut socket, Output::Error { message: "Только ведущий управляет комнатой." }).await { break; }
                             continue;
@@ -248,7 +267,10 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                         }
                         let mut current = room.state.lock().await;
                         let revision = current.revision.saturating_add(1);
-                        *current = Playback { track_id, position_ms, playing, rate, at_ms: now_ms(), revision };
+                        // Keep the host's sample time rather than the later catalog lookup time.
+                        // Bound untrusted client clocks and retain compatibility with older clients.
+                        let at_ms = playback_anchor(now, playing, sampled_at_ms, start_at_ms);
+                        *current = Playback { track_id, position_ms, playing, rate, at_ms, revision };
                         let _ = room.updates.send(current.clone());
                     }
                     Err(_) => {
@@ -263,7 +285,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                     Err(broadcast::error::RecvError::Lagged(_)) => room.state.lock().await.clone(),
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                if !send(&mut socket, Output::Playback { playback }).await { break; }
+                if !host && !send(&mut socket, Output::Playback { playback }).await { break; }
             }
             _ = heartbeat.tick() => {
                 if last_read.elapsed() >= Duration::from_secs(55)
@@ -276,6 +298,26 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
     if host {
         disconnect_host(&room).await;
     }
+}
+
+/// A future anchor is an announced start, not a sample from a future clock.
+fn playback_anchor(
+    now: u64,
+    playing: bool,
+    sampled_at_ms: Option<u64>,
+    start_at_ms: Option<u64>,
+) -> u64 {
+    if playing
+        && let Some(start) = start_at_ms
+        && start <= now.saturating_add(4_000)
+        && now.saturating_sub(start) <= 5_000
+    {
+        return start;
+    }
+    sampled_at_ms
+        .filter(|at| *at <= now.saturating_add(100) && now.saturating_sub(*at) <= 5_000)
+        .unwrap_or(now)
+        .min(now)
 }
 
 async fn disconnect_host(room: &Room) {
@@ -306,4 +348,27 @@ async fn send(socket: &mut WebSocket, message: Output) -> bool {
         .await,
         Ok(Ok(()))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_anchor;
+
+    #[test]
+    fn scheduled_start_is_bounded_and_only_used_for_playing() {
+        assert_eq!(
+            playback_anchor(10_000, true, Some(9_900), Some(11_200)),
+            11_200
+        );
+        assert_eq!(
+            playback_anchor(10_000, true, Some(9_900), Some(15_000)),
+            9_900
+        );
+        assert_eq!(
+            playback_anchor(10_000, false, Some(9_900), Some(11_200)),
+            9_900
+        );
+        assert_eq!(playback_anchor(10_000, true, Some(99_000), None), 10_000);
+        assert_eq!(playback_anchor(10_000, true, Some(4_000), None), 10_000);
+    }
 }

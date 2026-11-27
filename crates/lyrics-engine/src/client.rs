@@ -34,19 +34,18 @@ impl LyricsClient {
                 sources: Vec::new(),
             });
         }
-        // Оба источника ограничены суммарно: медленный ответ не держит запрос.
+        // Оба источника запускаются одновременно и имеют независимый таймаут.
         // Тело читаем с лимитом до парсинга, чтобы большой ответ не раздувал память.
         let timed = async {
             tokio::time::timeout(SOURCE_TIMEOUT, async {
-                let resp = self
+                let mut request = self
                     .http
                     .get("https://lrclib.net/api/get")
-                    .query(&[("artist_name", artist), ("track_name", title)])
-                    .send()
-                    .await
-                    .ok()?
-                    .error_for_status()
-                    .ok()?;
+                    .query(&[("artist_name", artist), ("track_name", title)]);
+                if let Some(ms) = duration_ms.filter(|ms| *ms > 0) {
+                    request = request.query(&[("duration", (ms as f64 / 1000.0).round() as u64)]);
+                }
+                let resp = request.send().await.ok()?.error_for_status().ok()?;
                 bounded_json(resp).await
             })
             .await
@@ -72,7 +71,18 @@ impl LyricsClient {
             .await
             .ok()?
         };
-        let (timed, plain) = tokio::join!(timed, plain);
+        tokio::pin!(timed, plain);
+        // A usable synchronized result wins immediately. Keep the plain fallback
+        // running concurrently, but don't wait for it when it isn't needed.
+        let (timed, plain) = tokio::select! {
+            value = &mut timed => {
+                let usable = value.as_ref().is_some_and(|v| {
+                    text(v, "syncedLyrics").is_some() || text(v, "plainLyrics").is_some()
+                });
+                if usable { (value, None) } else { (value, plain.await) }
+            }
+            fallback = &mut plain => (timed.await, fallback),
+        };
         let mut result = LyricsResult {
             synced: None,
             plain: None,
