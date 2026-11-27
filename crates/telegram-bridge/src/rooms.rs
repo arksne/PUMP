@@ -63,6 +63,8 @@ enum Input {
         position_ms: u64,
         playing: bool,
         rate: f64,
+        #[serde(default)]
+        sampled_at_ms: Option<u64>,
     },
 }
 
@@ -233,7 +235,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                     Ok(Input::Ping { sent_ms }) => {
                         if !send(&mut socket, Output::Pong { sent_ms, server_ms: now }).await { break; }
                     }
-                    Ok(Input::Playback { track_id, position_ms, playing, rate }) => {
+                    Ok(Input::Playback { track_id, position_ms, playing, rate, sampled_at_ms }) => {
                         if !host {
                             if !send(&mut socket, Output::Error { message: "Только ведущий управляет комнатой." }).await { break; }
                             continue;
@@ -248,7 +250,13 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                         }
                         let mut current = room.state.lock().await;
                         let revision = current.revision.saturating_add(1);
-                        *current = Playback { track_id, position_ms, playing, rate, at_ms: now_ms(), revision };
+                        // Keep the host's sample time rather than the later catalog lookup time.
+                        // Bound untrusted client clocks and retain compatibility with older clients.
+                        let at_ms = sampled_at_ms
+                            .filter(|at| *at <= now.saturating_add(100) && now.saturating_sub(*at) <= 5_000)
+                            .unwrap_or(now)
+                            .min(now);
+                        *current = Playback { track_id, position_ms, playing, rate, at_ms, revision };
                         let _ = room.updates.send(current.clone());
                     }
                     Err(_) => {
