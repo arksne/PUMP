@@ -591,6 +591,44 @@ class PlayerTest(unittest.TestCase):
             self.assertEqual(errors,[])
             browser.close()
 
+    def test_local_analysis_and_two_deck_crossfade(self):
+        _,_,data=self.request("/api/search?source=full&q=North")
+        track=json.loads(data)["tracks"][0]
+        _,_,session=self.request("/api/session",body={})
+        auth={"Authorization":"Bearer "+json.loads(session)["token"]}
+        _,_,body=self.request("/api/analysis/"+track["id"],headers=auth)
+        features=json.loads(body)
+        self.assertGreater(features["duration_seconds"],39)
+        self.assertGreater(features["true_peak"],0)
+        self.assertIn("integrated_lufs",features)
+        _,_,cached=self.request("/api/analysis/"+track["id"],headers=auth)
+        self.assertEqual(json.loads(cached),features)
+        with self.assertRaises(HTTPError) as external:
+            self.request("/api/analysis/au-Public1",headers=auth)
+        self.assertEqual(external.exception.code,404)
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            page.add_init_script("localStorage.setItem('pump.crossfadeSeconds','4')")
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("full")
+            page.locator("#qInput").fill("Loop")
+            page.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(page,"audio => audio.currentTime > 0.6")
+            page.evaluate("() => { window.firstDeck=audio; audio.currentTime=34; }")
+            page.wait_for_function("() => transition?.phase==='fading'",timeout=10000)
+            self.assertTrue(page.evaluate("() => !transition.from.paused && !transition.to.paused"))
+            expect(page.locator("#tTitle")).to_have_text("South Loop",timeout=10000)
+            self.assertTrue(page.evaluate("() => audio!==window.firstDeck && window.firstDeck.paused"))
+            wait_for_audio(page,"audio => !audio.paused && audio.currentTime > 0.5 && audio.currentTime < 12")
+            self.assertEqual(errors,[])
+            browser.close()
+
     def test_lyrics_word_highlight_tick_and_pause(self):
         doc = {"format": "enhanced_lrc",
                "lines": [{"text": "one two", "start_ms": 1000, "end_ms": 3000,
