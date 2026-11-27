@@ -11,6 +11,7 @@ const MAX_JSON: usize = 1024 * 1024;
 
 pub struct AudiusClient {
     http: reqwest::Client,
+    api: String,
     key: Option<String>,
     media_hosts: Vec<String>,
 }
@@ -68,6 +69,19 @@ fn public_track(value: &Value) -> Option<Track> {
     })
 }
 
+fn fixture_base(value: &str) -> Option<Url> {
+    let url = Url::parse(value).ok()?;
+    (url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port().is_some()
+        && url.path() == "/v1"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
 fn safe_media_url(url: &Url, allowed: &[String]) -> bool {
     url.scheme() == "https"
         && url.port().is_none()
@@ -83,8 +97,14 @@ fn safe_media_url(url: &Url, allowed: &[String]) -> bool {
 
 impl AudiusClient {
     pub fn from_env(http: reqwest::Client) -> Self {
+        // Explicit, loopback-only fixture for deterministic end-to-end tests.
+        let api = std::env::var("PUMP_AUDIUS_TEST_API_BASE")
+            .ok()
+            .filter(|value| fixture_base(value).is_some())
+            .unwrap_or_else(|| API.to_owned());
         Self {
             http,
+            api,
             key: std::env::var("PUMP_AUDIUS_API_KEY")
                 .ok()
                 .filter(|key| !key.trim().is_empty()),
@@ -100,7 +120,9 @@ impl AudiusClient {
 
     fn api_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
         let request = self.http.request(method, url).query(&[("app_name", "PUMP")]);
-        if let Some(key) = &self.key {
+        if self.api == API
+            && let Some(key) = &self.key
+        {
             request.header("x-api-key", key)
         } else {
             request
@@ -130,7 +152,7 @@ impl AudiusClient {
     pub async fn search(&self, term: &str) -> Result<Vec<Track>, ApiError> {
         let value = self
             .json(
-                self.api_request(Method::GET, &format!("{API}/tracks/search"))
+                self.api_request(Method::GET, &format!("{}/tracks/search", self.api))
                     .query(&[("query", term), ("limit", "16")]),
             )
             .await?;
@@ -148,7 +170,7 @@ impl AudiusClient {
             return Err(ApiError::missing("Запись Audius не найдена."));
         }
         let value = self
-            .json(self.api_request(Method::GET, &format!("{API}/tracks/{id}")))
+            .json(self.api_request(Method::GET, &format!("{}/tracks/{id}", self.api)))
             .await?;
         public_track(&value["data"])
             .filter(|track| track.id == format!("au-{id}"))
@@ -163,13 +185,15 @@ impl AudiusClient {
     ) -> Result<reqwest::Response, ApiError> {
         // Recheck permissions before every new media request.
         self.track(id).await?;
-        let mut url = Url::parse(&format!("{API}/tracks/{id}/stream"))
+        let mut url = Url::parse(&format!("{}/tracks/{id}/stream", self.api))
             .map_err(|_| unavailable())?;
         url.query_pairs_mut()
             .append_pair("preview", "false")
             .append_pair("app_name", "PUMP");
         for hop in 0..=4 {
-            if !safe_media_url(&url, &self.media_hosts) {
+            if !safe_media_url(&url, &self.media_hosts)
+                && !fixture_base(&self.api).is_some_and(|base| base.origin() == url.origin())
+            {
                 return Err(ApiError::unavailable("Медиа-хост Audius не разрешён настройками."));
             }
             let mut request = self
@@ -178,6 +202,7 @@ impl AudiusClient {
                 .timeout(Duration::from_secs(24 * 60 * 60));
             // API credentials must never follow redirects to a media host.
             if hop == 0
+                && self.api == API
                 && let Some(key) = &self.key
             {
                 request = request.header("x-api-key", key);
@@ -244,6 +269,9 @@ mod tests {
 
     #[test]
     fn redirects_are_explicitly_allowed() {
+        assert!(fixture_base("http://127.0.0.1:9000/v1").is_some());
+        assert!(fixture_base("http://127.0.0.1:9000/v1?x=1").is_none());
+        assert!(fixture_base("http://192.168.1.1:9000/v1").is_none());
         let allowed = vec!["media.example.com".to_string()];
         for valid in ["https://api.audius.co/v1/tracks", "https://media.example.com/a"] {
             assert!(safe_media_url(&Url::parse(valid).unwrap(), &allowed));
