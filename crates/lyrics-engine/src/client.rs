@@ -45,12 +45,7 @@ impl LyricsClient {
                 if let Some(ms) = duration_ms.filter(|ms| *ms > 0) {
                     request = request.query(&[("duration", (ms as f64 / 1000.0).round() as u64)]);
                 }
-                let resp = request
-                    .send()
-                    .await
-                    .ok()?
-                    .error_for_status()
-                    .ok()?;
+                let resp = request.send().await.ok()?.error_for_status().ok()?;
                 bounded_json(resp).await
             })
             .await
