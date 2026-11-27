@@ -23,6 +23,12 @@ All changes accumulate in `fix/playback-stability`, draft PR #2. No intermediate
 - DSP: local analysis API uses existing Rust Symphonia + MusicAnalyzer, one blocking worker, bounded PCM/file size and metadata-keyed cache. Browser dual-deck Crossfade shares WebAudio/Rust DSP chain; Automix uses cached BPM, beatgrid, LUFS, bounded tempo adjustment and fallback. Added real local audio and crossfade browser test. No physical audio-output verification yet.
 - JavaScript syntax parsed successfully via V8 after audio integration. The previous CI runs 46049909276 and 46050763669 failed rustfmt; the reported formatting corrections are committed. Final candidate CI must run without cancellation.
 
+## Verified baseline: 32a095b
+
+[CI run 55](https://github.com/arksne/PUMP/actions/runs/46052511739) completed successfully: rustfmt, workspace tests, analysis tests, Clippy (all features), WASM checks, Docker and browser tests. Browser suite: 12 passed, 3 live SoundCloud tests skipped because the service was unavailable from the runner. This verifies the local provider fixtures, reconnect, lyrics intervals, analysis and crossfade on that commit, not real-world external streams or speaker-output latency.
+
+The next candidate adds a persisted listener-relative manual offset, room RTT/timeline diagnostics and a deterministic delayed/dropped WebSocket message test. Re-run CI on that candidate; the displayed position error is not a physical latency measurement. Set PUMP_REQUIRE_SOUNDCLOUD_LIVE=1 when running tests/browser.py to treat unavailable live SoundCloud as a failure instead of a skip.
+
 ## Blocking verification
 
 Physical Telegram/mobile devices, external account-dependent providers and real-world room output latency are not verified by the GitHub connector. Record actual measured evidence when available. Do not disable checks or infer passing tests from compilation alone.

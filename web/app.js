@@ -28,6 +28,8 @@ let token = stored("pump.session", ""), pending = stored("pump.listens", []);
 let gettingSession = null, activeSession = null, sending = null, listening = null, meter = null;
 let localOnly=stored("pump.localOnly",false);
 let room = null;
+let roomOffsetMs=Number(stored("pump.roomOffsetMs",0));
+if(!Number.isFinite(roomOffsetMs)||Math.abs(roomOffsetMs)>500)roomOffsetMs=0;
 let scrobbleState=null,lastfmConnected=false;
 let streamCandidates=[], streamIndex=0, streamSelection=0;
 let providerSelection=0;
@@ -632,6 +634,9 @@ function connectRoom(state) {
   });
 }
 function renderRoom(message) {
+  node("roomDiagnostics").hidden=!room?.connected;
+  node("roomOffsetControl").hidden=!isGuest();
+  renderRoomDiagnostics();
   node("roomConnected").hidden = !room || room.host === null;
   node("enableRoomSound").hidden = !isGuest() || room.sound;
   text("roomStatus",message || (room?.host === true ? "Ведущий · "+room.code :
@@ -710,6 +715,18 @@ async function applyRemote(state,playback) {
     if (request === state.trackRequest) state.loading = null;
   }
 }
+// Media timeline estimate, not a measurement at the speaker.
+function roomTargetPosition(target,now,offset=0){
+  return (target.position_ms+(target.playing?Math.max(0,now-target.at_ms)*target.rate+offset*target.rate:0))/1000;
+}
+function renderRoomDiagnostics(){
+  if(!room?.connected){text("roomDiagnosticsText","");return;}
+  const rtt=Number.isFinite(room.rtt)?Math.round(room.rtt)+" мс":"измеряем…";
+  const target=room.desired;
+  const drift=isGuest()&&target&&target.track_id===selected?.id&&Number.isFinite(audio.duration)
+    ?Math.round((Math.max(0,Math.min(audio.duration,roomTargetPosition(target,roomNow()+room.skew,room.sound?roomOffsetMs:0)))-audio.currentTime)*1000):null;
+  text("roomDiagnosticsText","RTT: "+rtt+(drift===null?"":" · отклонение позиции: "+drift+" мс"));
+}
 function syncRoom() {
   if (!isGuest() || !room.connected || !room.desired || selected?.id !== room.desired.track_id) return;
   const state=room,target=state.desired;
@@ -721,7 +738,7 @@ function syncRoom() {
       state.guestStartTimer=setTimeout(()=>{if(room===state){clearGuestStart(state);syncRoom();}},untilStart);
     }
   }else clearGuestStart(state);
-  const position = (target.position_ms+(target.playing ? Math.max(0,now-target.at_ms)*target.rate : 0))/1000;
+  const position=roomTargetPosition(target,now,state.sound?roomOffsetMs:0);
   if(!Number.isFinite(audio.duration)||audio.seeking)return;
   const next=Math.min(Math.max(0,position),audio.duration);
   const drift=next-audio.currentTime;
@@ -846,7 +863,19 @@ document.addEventListener("keydown",event => {
 });
 window.addEventListener("pagehide",finalizeListen);
 window.addEventListener("online",() => flushListens().catch(() => {}));
-setInterval(() => { if (room?.host) publish(); else syncRoom(); },500);
+function setRoomOffset(value){
+  const offset=Number(value);
+  if(!Number.isFinite(offset))return;
+  roomOffsetMs=Math.round(Math.max(-500,Math.min(500,offset))/10)*10;
+  node("roomOffset").value=String(roomOffsetMs);
+  text("roomOffsetValue",(roomOffsetMs>0?"+":"")+roomOffsetMs+" мс");
+  persist("pump.roomOffsetMs",roomOffsetMs);
+  if(isGuest()){syncRoom();renderRoomDiagnostics();}
+}
+node("roomOffset").addEventListener("input",event=>setRoomOffset(event.target.value));
+node("roomOffsetReset").addEventListener("click",()=>setRoomOffset(0));
+setRoomOffset(roomOffsetMs);
+setInterval(() => { if (room?.host) publish(); else syncRoom(); if(room)renderRoomDiagnostics(); },500);
 setInterval(pingRoom,2000);
 search().then(() => {
   if (!selected && results.length) { queue = results.slice(); index = 0; selectTrack(queue[0]); }

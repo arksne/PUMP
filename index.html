@@ -319,6 +319,16 @@
           <button id="enableRoomSound" class="btn chip active" data-action="enable-room-sound" hidden>Включить звук</button>
           <button class="btn chip" data-action="leave-room">Выйти</button>
         </div>
+        <div id="roomDiagnostics" hidden>
+          <p id="roomDiagnosticsText" class="status"></p>
+          <div id="roomOffsetControl" hidden>
+            <label class="setting-row">Коррекция звука слушателя <output id="roomOffsetValue" for="roomOffset">0 мс</output>
+              <input id="roomOffset" type="range" min="-500" max="500" step="10" value="0" />
+            </label>
+            <p class="status">Если слышишь звук позже ведущего, увеличь значение. RTT и отклонение позиции не измеряют задержку Bluetooth или динамика.</p>
+            <button id="roomOffsetReset" class="btn chip" type="button">Сбросить коррекцию</button>
+          </div>
+        </div>
       </div>
     </section>
 

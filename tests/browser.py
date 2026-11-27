@@ -317,6 +317,8 @@ class PlayerTest(unittest.TestCase):
         body = json.loads(data)
         tracks = [t for t in body["tracks"] if t["kind"] == "full"]
         if not tracks and body.get("notice") and "недоступен" in body["notice"]:
+            if os.environ.get("PUMP_REQUIRE_SOUNDCLOUD_LIVE") == "1":
+                self.fail("SoundCloud недоступен из этой сети (live-проверка обязательна)")
             self.skipTest("SoundCloud недоступен из этой сети")
         return tracks
 
@@ -804,6 +806,74 @@ class PlayerTest(unittest.TestCase):
             host.locator("#statsPeriod").select_option("month")
             expect(host.locator("#statsArtists")).to_contain_text("PUMP Test Artist")
             self.assertEqual(errors, [])
+            browser.close()
+
+    def test_room_delayed_and_dropped_control_messages(self):
+        """Delay and drop inbound room updates, not audio sample clocks."""
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            device=driver.devices["Pixel 7"]
+            host=browser.new_context(**device).new_page()
+            guest=browser.new_context(**device).new_page()
+            guest.add_init_script("""(() => {
+                const Native=window.WebSocket;
+                window.roomDelayed=0; window.roomDropped=0;
+                window.WebSocket=class extends Native {
+                    addEventListener(type, callback, options){
+                        if(type!=="message"||!this.url.includes("/ws/room/"))
+                            return super.addEventListener(type,callback,options);
+                        return super.addEventListener(type,event=>{
+                            const message=JSON.parse(event.data);
+                            if(message.type!=="playback")return callback.call(this,event);
+                            const n=++window.roomDelayed;
+                            if(n%5===0){window.roomDropped++;return;}
+                            setTimeout(()=>callback.call(this,event),[180,40,260,80][n%4]);
+                        },options);
+                    }
+                };
+            })()""")
+            errors=[]
+            for page in (host,guest):
+                page.on("pageerror",lambda error:errors.append(str(error)))
+                page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"synced":None,"plain":None}))
+                page.goto(self.origin)
+            host.locator("#tabSearch").click()
+            host.locator("#source").select_option("full")
+            host.locator("#qInput").fill("North")
+            host.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(host,"audio => audio.currentTime > 0.5")
+            host.locator("#tabRooms").click()
+            host.locator("#createRoom").click()
+            expect(host.locator("#roomStatus")).to_contain_text("Ведущий")
+            guest.locator("#tabRooms").click()
+            guest.locator("#roomCode").fill(host.locator("#roomCode").input_value())
+            guest.get_by_role("button",name="Войти",exact=True).click()
+            expect(guest.locator("#roomStatus")).to_contain_text("Слушатель")
+            guest.locator("#enableRoomSound").click()
+            wait_for_audio(guest,"audio => !audio.paused && audio.currentTime > 0.5")
+            expect(guest.locator("#roomDiagnosticsText")).to_contain_text("RTT:")
+            guest.locator("#roomOffset").evaluate("(input) => { input.value=200; input.dispatchEvent(new Event('input')); }")
+            expect(guest.locator("#roomOffsetValue")).to_have_text("+200 мс")
+            self.assertEqual(guest.evaluate("() => JSON.parse(localStorage.getItem('pump.roomOffsetMs'))"),200)
+            guest.locator("#roomOffsetReset").click()
+            expect(guest.locator("#roomOffsetValue")).to_have_text("0 мс")
+            host.locator("#tabPlayer").click()
+            host.locator("#seekBar").evaluate("(bar) => { bar.value=50; bar.dispatchEvent(new Event('input',{bubbles:true})); }")
+            wait_for_audio(guest,"audio => audio.currentTime >= 19.5")
+            guest.wait_for_function("() => window.roomDropped>=1",timeout=10000)
+            host.locator("#playBtn").click()
+            wait_for_audio(guest,"audio => audio.paused")
+            guest.wait_for_function("() => !room.desired.playing && Math.abs(room.desired.position_ms/1000-audio.currentTime)<0.06")
+            h=host.locator("#audio").evaluate("(audio)=>audio.currentTime")
+            g=guest.locator("#audio").evaluate("(audio)=>audio.currentTime")
+            self.assertLess(abs(h-g),0.15)
+            host.locator("#playBtn").click()
+            wait_for_audio(host,"audio => !audio.paused")
+            wait_for_audio(guest,"audio => !audio.paused")
+            guest.wait_for_function("() => Math.abs(roomTargetPosition(room.desired,roomNow()+room.skew)-audio.currentTime)<0.35",timeout=10000)
+            self.assertGreaterEqual(guest.evaluate("() => window.roomDelayed"),5)
+            self.assertEqual(errors,[])
             browser.close()
 
     def test_soundcloud_playback_range_seek_and_refresh(self):
