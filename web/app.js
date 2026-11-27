@@ -348,6 +348,9 @@ async function loadLyrics(track) {
   lyricRequest = request;
   lyricLines = [];
   lyricIndex = -1;
+  lyricWords = [];
+  lyricWordIndex = -1;
+  stopLyricAnim();
   const box = node("lyricsBox");
   box.replaceChildren(element("p","status","Загружаем текст…"));
   try {
@@ -367,9 +370,18 @@ async function loadLyrics(track) {
     else lyricLines.forEach((line,i)=>{
       const button=element("button","l-line");button.type="button";button.dataset.action="lyric";button.dataset.value=String(i);
       if(line.singer_ids?.length){button.append(element("span","lyric-singer",line.singer_ids.join(" · ")));button.dataset.singerSide=line.alignment==="right"||line.alignment==="end"?"right":"left";}
-      if(line.words?.length)for(const word of line.words){const span=element("span","lyric-word",word.text);const start=Number(word.start_ms),end=word.end_ms==null?Infinity:Number(word.end_ms);span.dataset.start=String(start);span.dataset.end=String(end);button.append(span);lyricWords.push({el:span,start,end});}
+      if(line.words?.length)line.words.forEach((word,j)=>{
+        const span=element("span","lyric-word",word.text);
+        const start=Number(word.start_ms);
+        const next=line.words[j+1]?.start_ms??line.end_ms??Infinity;
+        const end=word.end_ms==null?Number(next):Number(word.end_ms);
+        button.append(span);
+        if(Number.isFinite(start)&&end>=start)lyricWords.push({el:span,start,end});
+      });
       else button.append(document.createTextNode(line.text));box.append(button);
     });
+    lyricWords.sort((a,b)=>a.start-b.start);
+    paintLyricWords();
     syncLyrics();refreshLyricAnim();
   } catch (error) {
     if (!request.signal.aborted) box.replaceChildren(element("p","status",error.message));
@@ -377,10 +389,9 @@ async function loadLyrics(track) {
 }
 function syncLyrics(force=false) {
   const t = audio.currentTime;
-  let next = lyricIndex;
-  if (next >= lyricLines.length) next = lyricLines.length - 1;
-  while (next >= 0 && lyricLines[next].time > t) next--;
-  while (next+1 < lyricLines.length && lyricLines[next+1].time <= t) next++;
+  let lo=0,hi=lyricLines.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(lyricLines[mid].time<=t)lo=mid+1;else hi=mid;}
+  const next=lo-1;
   if (next === lyricIndex && !force) return;
   const children = node("lyricsBox").children;
   children.item(lyricIndex)?.classList.remove("active");
@@ -472,7 +483,7 @@ async function joinRoom(raw) {
   const address = new URL("/ws/room/"+code,location.href);
   address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(address);
-  const state = {code,socket,host:null,sound:false,desired:null,skew:0,rtt:Infinity,loading:null,trackRequest:0,timer:null};
+  const state = {code,socket,host:null,sound:false,desired:null,skew:0,rtt:Infinity,clockSamples:[],loading:null,trackRequest:0,timer:null};
   room = state;
   text("roomStatus","Подключаемся…");
   socket.addEventListener("open",() => {
@@ -493,9 +504,12 @@ async function joinRoom(raw) {
       applyRemote(state,response.playback);
     } else if (response.type === "pong") {
       const rtt = Date.now()-response.sent_ms;
-      if (rtt >= 0 && rtt < state.rtt+8) {
-        state.rtt = Math.min(state.rtt,rtt);
-        state.skew = response.server_ms-(response.sent_ms+rtt/2);
+      if (rtt >= 0 && rtt < 10000) {
+        state.clockSamples.push({rtt,skew:response.server_ms-(response.sent_ms+rtt/2)});
+        if(state.clockSamples.length>12)state.clockSamples.shift();
+        const best=state.clockSamples.reduce((a,b)=>a.rtt<=b.rtt?a:b);
+        state.rtt=best.rtt;
+        state.skew=best.skew;
       }
     } else if (response.type === "error") {
       text("roomStatus",response.message);
@@ -537,7 +551,8 @@ function publish(paused=false) {
   room.socket.send(JSON.stringify({
     type:"playback",track_id:direct ? selected.id : null,
     position_ms:direct ? Math.round(Math.max(0,audio.currentTime || 0)*1000) : 0,
-    playing:Boolean(direct && !audio.paused && !audio.ended && !paused),rate:audio.playbackRate
+    playing:Boolean(direct && !audio.paused && !audio.ended && !audio.seeking && audio.readyState>=3 && !paused),rate:audio.playbackRate,
+    sampled_at_ms:Math.round(Date.now()+room.skew)
   }));
 }
 function publishSoon() {
@@ -571,13 +586,18 @@ function syncRoom() {
   if (!isGuest() || !room.desired || selected?.id !== room.desired.track_id) return;
   const target = room.desired;
   const position = (target.position_ms+(target.playing ? Math.max(0,Date.now()+room.skew-target.at_ms)*target.rate : 0))/1000;
-  if (Number.isFinite(audio.duration) && (Math.abs(audio.currentTime-position) > .15 || audio.paused && !target.playing)) {
-    const next = Math.min(Math.max(0,position),audio.duration);
-    if (Math.abs(audio.currentTime-next) > .05) audio.currentTime = next;
-  }
-  if (audio.playbackRate !== target.rate) audio.playbackRate = target.rate;
-  if (!target.playing || !room.sound) audio.pause();
-  else if (audio.paused && audio.readyState >= 1 && position < audio.duration) requestPlay();
+  if(!Number.isFinite(audio.duration)||audio.seeking)return;
+  const next=Math.min(Math.max(0,position),audio.duration);
+  const drift=next-audio.currentTime;
+  const shouldPlay=target.playing&&room.sound&&next<audio.duration;
+  // Seek for discontinuities; gently correct small network and decoder drift.
+  if(Math.abs(drift)>(shouldPlay&&!audio.paused ? .65 : .05))audio.currentTime=next;
+  const correction=shouldPlay&&!audio.paused&&Math.abs(drift)>.035&&Math.abs(drift)<=.65
+    ?Math.max(-.04,Math.min(.04,drift*.2)):0;
+  const correctedRate=Math.max(.5,Math.min(2,target.rate*(1+correction)));
+  if(Math.abs(audio.playbackRate-correctedRate)>.002)audio.playbackRate=correctedRate;
+  if(!shouldPlay)audio.pause();
+  else if(audio.paused&&audio.readyState>=2)requestPlay();
 }
 function enableRoomSound() {
   if (!isGuest()) return;
@@ -609,10 +629,12 @@ seek.addEventListener("input",() => {
 });
 audio.addEventListener("timeupdate",() => { updateTimeline(); syncLyrics(); sampleListening(); });
 audio.addEventListener("loadedmetadata",() => { updateTimeline(); updateButtons(); syncRoom(); });
+audio.addEventListener("waiting",publishSoon);
+audio.addEventListener("canplay",()=>{syncRoom();publishSoon();});
 audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
 audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); stopLyricAnim(); });
 audio.addEventListener("seeking",() => { meter = null; lyricWordIndex=-1; });
-audio.addEventListener("seeked",publishSoon);
+audio.addEventListener("seeked",()=>{publishSoon();syncLyrics(true);paintLyricWords();});
 audio.addEventListener("ended",() => {
   stopLyricAnim();
   finalizeListen();
@@ -678,8 +700,8 @@ document.addEventListener("keydown",event => {
 });
 window.addEventListener("pagehide",finalizeListen);
 window.addEventListener("online",() => flushListens().catch(() => {}));
-setInterval(() => { if (room?.host) publish(); else syncRoom(); },1000);
-setInterval(pingRoom,5000);
+setInterval(() => { if (room?.host) publish(); else syncRoom(); },500);
+setInterval(pingRoom,2000);
 search().then(() => {
   if (!selected && results.length) { queue = results.slice(); index = 0; selectTrack(queue[0]); }
 });
@@ -831,30 +853,22 @@ function refreshLyricAnim(){
   if(!lyricWords.length||audio.paused||document.hidden||!lyricVisible()){stopLyricAnim();return;}
   if(!lyricRaf)lyricRaf=requestAnimationFrame(tickLyricWords);
 }
+// Independent intervals preserve overlapping singers. Cache each rendered state
+// so unchanged words do not cause DOM writes on every animation frame.
+function paintLyricWords(){
+  const time=audio.currentTime*1000;
+  for(const word of lyricWords){
+    const status=time<word.start?0:time<word.end?1:2;
+    if(word.status===status)continue;
+    word.status=status;
+    word.el.classList.toggle("current",status===1);
+    word.el.classList.toggle("sung",status===2);
+  }
+}
 function tickLyricWords(){
   lyricRaf=0;
   if(audio.paused||document.hidden||!lyricWords.length||!lyricVisible())return;
-  const time=audio.currentTime*1000;
-  const effEnd = j => Math.min(lyricWords[j].end, j + 1 < lyricWords.length ? lyricWords[j + 1].start : Infinity);
-  let i=lyricWordIndex;
-  if(i<0||i>=lyricWords.length||time<lyricWords[i].start||time>=effEnd(i)){
-    let lo=0,hi=lyricWords.length;
-    while(lo<hi){const mid=(lo+hi)>>1;if(lyricWords[mid].start<=time)lo=mid+1;else hi=mid;}
-    i=lo-1;
-  }
-  const changed=[];
-  if(lyricWordIndex!==i){
-    for(let k=Math.min(lyricWordIndex,i)-1;k<=Math.max(lyricWordIndex,i)+1;k++)if(k>=0&&k<lyricWords.length)changed.push(k);
-    lyricWordIndex=i;
-  }else{
-    if(i>=0)changed.push(i);
-    if(i+1<lyricWords.length&&lyricWords[i+1].start<=time+200)changed.push(i+1);
-  }
-  for(const k of changed){
-    const word=lyricWords[k], end=effEnd(k);
-    word.el.classList.toggle("current",time>=word.start&&time<end);
-    word.el.classList.toggle("sung",time>=end);
-  }
+  paintLyricWords();
   syncLyrics();
   lyricRaf=requestAnimationFrame(tickLyricWords);
 }
