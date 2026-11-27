@@ -2,6 +2,7 @@
 
 use core_streaming as catalog;
 use core_streaming::ApiError;
+mod analysis_api;
 mod cards;
 mod controls;
 mod imports;
@@ -35,6 +36,7 @@ pub(crate) const MAX_TRACK_MS: u64 = 24 * 60 * 60 * 1000;
 #[derive(Clone)]
 pub(crate) struct App {
     catalog: Arc<Catalog>,
+    analysis: analysis_api::AnalysisCache,
     http: reqwest::Client,
     stats: stats::Store,
     rooms: rooms::Rooms,
@@ -137,6 +139,7 @@ pub async fn run() -> Result<()> {
         imports: imports::Imports::default(),
         scrobbles: scrobbling::Scrobbles::new(data.join("lastfm")),
         catalog,
+        analysis: analysis_api::AnalysisCache::default(),
         stats,
         rooms: rooms::Rooms::default(),
         controls: controls::Controls::default(),
@@ -256,6 +259,7 @@ fn router(app: App) -> Router {
             }),
         )
         .route("/api/search", get(search))
+        .route("/api/analysis/{id}", get(analysis_api::track))
         .route("/source/sc/{id}", get(source_sc))
         .route("/source/au/{id}", get(source_au))
         .route("/api/nas", get(nas_api::list))
