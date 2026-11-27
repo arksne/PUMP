@@ -65,6 +65,8 @@ enum Input {
         rate: f64,
         #[serde(default)]
         sampled_at_ms: Option<u64>,
+        #[serde(default)]
+        start_at_ms: Option<u64>,
     },
 }
 
@@ -235,7 +237,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                     Ok(Input::Ping { sent_ms }) => {
                         if !send(&mut socket, Output::Pong { sent_ms, server_ms: now }).await { break; }
                     }
-                    Ok(Input::Playback { track_id, position_ms, playing, rate, sampled_at_ms }) => {
+                    Ok(Input::Playback { track_id, position_ms, playing, rate, sampled_at_ms, start_at_ms }) => {
                         if !host {
                             if !send(&mut socket, Output::Error { message: "Только ведущий управляет комнатой." }).await { break; }
                             continue;
@@ -252,10 +254,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                         let revision = current.revision.saturating_add(1);
                         // Keep the host's sample time rather than the later catalog lookup time.
                         // Bound untrusted client clocks and retain compatibility with older clients.
-                        let at_ms = sampled_at_ms
-                            .filter(|at| *at <= now.saturating_add(100) && now.saturating_sub(*at) <= 5_000)
-                            .unwrap_or(now)
-                            .min(now);
+                        let at_ms = playback_anchor(now, playing, sampled_at_ms, start_at_ms);
                         *current = Playback { track_id, position_ms, playing, rate, at_ms, revision };
                         let _ = room.updates.send(current.clone());
                     }
@@ -286,6 +285,26 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
     }
 }
 
+/// A future anchor is an announced start, not a sample from a future clock.
+fn playback_anchor(
+    now: u64,
+    playing: bool,
+    sampled_at_ms: Option<u64>,
+    start_at_ms: Option<u64>,
+) -> u64 {
+    if playing
+        && let Some(start) = start_at_ms
+        && start <= now.saturating_add(4_000)
+        && now.saturating_sub(start) <= 5_000
+    {
+        return start;
+    }
+    sampled_at_ms
+        .filter(|at| *at <= now.saturating_add(100) && now.saturating_sub(*at) <= 5_000)
+        .unwrap_or(now)
+        .min(now)
+}
+
 async fn disconnect_host(room: &Room) {
     let mut current = room.state.lock().await;
     if room.hosts.fetch_sub(1, Ordering::Relaxed) == 1 && current.playing {
@@ -314,4 +333,18 @@ async fn send(socket: &mut WebSocket, message: Output) -> bool {
         .await,
         Ok(Ok(()))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_anchor;
+
+    #[test]
+    fn scheduled_start_is_bounded_and_only_used_for_playing() {
+        assert_eq!(playback_anchor(10_000, true, Some(9_900), Some(11_200)), 11_200);
+        assert_eq!(playback_anchor(10_000, true, Some(9_900), Some(15_000)), 9_900);
+        assert_eq!(playback_anchor(10_000, false, Some(9_900), Some(11_200)), 9_900);
+        assert_eq!(playback_anchor(10_000, true, Some(99_000), None), 10_000);
+        assert_eq!(playback_anchor(10_000, true, Some(4_000), None), 10_000);
+    }
 }
