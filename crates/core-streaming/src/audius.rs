@@ -25,7 +25,12 @@ fn public_track(value: &Value) -> Option<Track> {
         || value["is_stream_gated"].as_bool() != Some(false)
         || value["is_unlisted"].as_bool() == Some(true)
         || value["is_scheduled_release"].as_bool() == Some(true)
+        || value["is_delete"].as_bool() == Some(true)
+        || value["is_available"].as_bool() == Some(false)
         || value["access"]["stream"].as_bool() == Some(false)
+        || value["access_authorities"]
+            .as_array()
+            .is_some_and(|authorities| !authorities.is_empty())
         || value["allowed_api_keys"]
             .as_array()
             .is_some_and(|keys| !keys.is_empty())
@@ -266,6 +271,15 @@ mod tests {
         value["access"] = json!({"stream": false});
         assert!(public_track(&value).is_none());
         value["access"] = json!({"stream": true});
+        value["access_authorities"] = json!(["0x123"]);
+        assert!(public_track(&value).is_none());
+        value["access_authorities"] = json!([]);
+        value["is_available"] = json!(false);
+        assert!(public_track(&value).is_none());
+        value["is_available"] = json!(true);
+        value["is_delete"] = json!(true);
+        assert!(public_track(&value).is_none());
+        value["is_delete"] = json!(false);
         value["id"] = json!("../private");
         assert!(public_track(&value).is_none());
     }
