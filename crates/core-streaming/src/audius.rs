@@ -36,11 +36,7 @@ fn public_track(value: &Value) -> Option<Track> {
     let title = value["title"].as_str()?.trim();
     let artist = value["user"]["name"].as_str()?.trim();
     let duration_ms = value["duration"].as_u64()?.checked_mul(1000)?;
-    if title.is_empty()
-        || artist.is_empty()
-        || duration_ms == 0
-        || duration_ms > MAX_TRACK_MS
-    {
+    if title.is_empty() || artist.is_empty() || duration_ms == 0 || duration_ms > MAX_TRACK_MS {
         return None;
     }
     let artwork = value["artwork"]["480x480"]
@@ -119,7 +115,10 @@ impl AudiusClient {
     }
 
     fn api_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
-        let request = self.http.request(method, url).query(&[("app_name", "PUMP")]);
+        let request = self
+            .http
+            .request(method, url)
+            .query(&[("app_name", "PUMP")]);
         if self.api == API
             && let Some(key) = &self.key
         {
@@ -135,7 +134,9 @@ impl AudiusClient {
             return Err(ApiError::missing("Запись Audius не найдена."));
         }
         if !response.status().is_success()
-            || response.content_length().is_some_and(|len| len > MAX_JSON as u64)
+            || response
+                .content_length()
+                .is_some_and(|len| len > MAX_JSON as u64)
         {
             return Err(unavailable());
         }
@@ -194,7 +195,9 @@ impl AudiusClient {
             if !safe_media_url(&url, &self.media_hosts)
                 && !fixture_base(&self.api).is_some_and(|base| base.origin() == url.origin())
             {
-                return Err(ApiError::unavailable("Медиа-хост Audius не разрешён настройками."));
+                return Err(ApiError::unavailable(
+                    "Медиа-хост Audius не разрешён настройками.",
+                ));
             }
             let mut request = self
                 .http
@@ -273,7 +276,10 @@ mod tests {
         assert!(fixture_base("http://127.0.0.1:9000/v1?x=1").is_none());
         assert!(fixture_base("http://192.168.1.1:9000/v1").is_none());
         let allowed = vec!["media.example.com".to_string()];
-        for valid in ["https://api.audius.co/v1/tracks", "https://media.example.com/a"] {
+        for valid in [
+            "https://api.audius.co/v1/tracks",
+            "https://media.example.com/a",
+        ] {
             assert!(safe_media_url(&Url::parse(valid).unwrap(), &allowed));
         }
         for invalid in [
