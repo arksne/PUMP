@@ -523,6 +523,13 @@ class PlayerTest(unittest.TestCase):
             page.locator("#audio").evaluate("(audio) => { audio.pause(); audio.currentTime = 1.5; }")
             expect(page.locator(".lyric-word.current")).to_have_text("one")
             self.assertEqual(page.locator(".lyric-word.sung").count(), 0)
+            for _ in range(6):
+                page.locator("#lyricEarlier").click()
+            expect(page.locator("#lyricOffsetValue")).to_have_text("+600 мс")
+            expect(page.locator(".lyric-word.current")).to_have_text("two")
+            self.assertEqual(page.evaluate("() => JSON.parse(localStorage.getItem('pump.lyricOffsets'))[0][1]"),600)
+            page.locator("#lyricReset").click()
+            expect(page.locator(".lyric-word.current")).to_have_text("one")
             self.assertEqual(errors, [])
             browser.close()
 
