@@ -23,10 +23,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Semaphore, broadcast};
 use uuid::Uuid;
 
 const LIFETIME: u64 = 6 * 60 * 60 * 1000;
+static CONNECTIONS: Semaphore = Semaphore::const_new(512);
 
 #[derive(Clone, Default)]
 pub(crate) struct Rooms(Arc<Mutex<HashMap<String, Arc<Room>>>>);
@@ -36,6 +37,7 @@ struct Room {
     state: Mutex<Playback>,
     activity: AtomicU64,
     hosts: AtomicUsize,
+    peers: Arc<Semaphore>,
     updates: broadcast::Sender<Playback>,
 }
 
@@ -125,6 +127,7 @@ pub(crate) async fn create(
             }),
             activity: AtomicU64::new(now),
             hosts: AtomicUsize::new(0),
+            peers: Arc::new(Semaphore::new(32)),
             updates,
         }),
     );
@@ -169,10 +172,19 @@ pub(crate) async fn upgrade(
         .cloned()
         .filter(|room| now_ms().saturating_sub(room.activity.load(Ordering::Relaxed)) < LIFETIME)
         .ok_or_else(|| ApiError::missing("Комната не найдена."))?;
+    let global = CONNECTIONS.try_acquire().map_err(|_| {
+        ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Сервер комнат занят.")
+    })?;
+    let peer = room.peers.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(StatusCode::TOO_MANY_REQUESTS, "В комнате нет свободных мест.")
+    })?;
     Ok(ws
         .max_message_size(4096)
         .max_frame_size(4096)
-        .on_upgrade(move |socket| serve(socket, app, room)))
+        .on_upgrade(move |socket| async move {
+            let (_global, _peer) = (global, peer);
+            serve(socket, app, room).await;
+        }))
 }
 
 async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
@@ -270,7 +282,7 @@ async fn serve(mut socket: WebSocket, app: App, room: Arc<Room>) {
                     Err(broadcast::error::RecvError::Lagged(_)) => room.state.lock().await.clone(),
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                if !send(&mut socket, Output::Playback { playback }).await { break; }
+                if !host && !send(&mut socket, Output::Playback { playback }).await { break; }
             }
             _ = heartbeat.tick() => {
                 if last_read.elapsed() >= Duration::from_secs(55)
