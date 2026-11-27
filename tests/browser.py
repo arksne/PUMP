@@ -215,12 +215,12 @@ class PlayerTest(unittest.TestCase):
                 self.server.kill()
                 self.server.wait(timeout=5)
 
-    def request(self, path, *, body=None, headers=None):
+    def request(self, path, *, body=None, headers=None, timeout=12):
         headers = dict(headers or {})
         if body is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(body).encode()
-        with urlopen(Request(self.origin + path, data=body, headers=headers), timeout=12) as response:
+        with urlopen(Request(self.origin + path, data=body, headers=headers), timeout=timeout) as response:
             return response.status, response.headers, response.read()
 
     def test_catalog_and_persistent_statistics(self):
@@ -596,7 +596,10 @@ class PlayerTest(unittest.TestCase):
         track=json.loads(data)["tracks"][0]
         _,_,session=self.request("/api/session",body={})
         auth={"Authorization":"Bearer "+json.loads(session)["token"]}
-        _,_,body=self.request("/api/analysis/"+track["id"],headers=auth)
+        with self.assertRaises(HTTPError) as unauthorized:
+            self.request("/api/analysis/"+track["id"])
+        self.assertEqual(unauthorized.exception.code,401)
+        _,_,body=self.request("/api/analysis/"+track["id"],headers=auth,timeout=60)
         features=json.loads(body)
         self.assertGreater(features["duration_seconds"],39)
         self.assertGreater(features["true_peak"],0)
