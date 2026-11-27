@@ -228,7 +228,7 @@ cover.addEventListener("error", () => { cover.hidden = true; node("coverFallback
 
 function requestPlay() {
   startAudioGraph();
-  if(isGuest()&&(!room.sound||!room.desired?.playing))return;
+  if(isGuest()&&(!room.connected||!room.sound||!room.desired?.playing||selected?.id!==room.desired.track_id))return;
   if (selected?.kind === "youtube") {
     if(!streamCandidates.length){loadStreams();return;}
     playStreamCandidate();return;
@@ -492,6 +492,8 @@ async function joinRoom(raw) {
   text("roomStatus","Подключаемся…");
   connectRoom(state);
 }
+// Use an epoch anchored to the monotonic browser clock, not wall-clock changes.
+function roomNow(){return performance.timeOrigin+performance.now();}
 function connectRoom(state) {
   if(room!==state)return;
   const socket = new WebSocket(state.address);
@@ -512,7 +514,7 @@ function connectRoom(state) {
       state.connected=true;
       state.retries=0;
       state.desired=null;
-      state.skew = response.server_ms-Date.now();
+      state.skew = response.server_ms-roomNow();
       if (state.host) publish();
       else { audio.pause(); applyRemote(state,response.playback); }
       pingRoom();
@@ -520,7 +522,7 @@ function connectRoom(state) {
     } else if (response.type === "playback" && state.connected && state.host===false) {
       applyRemote(state,response.playback);
     } else if (response.type === "pong") {
-      const rtt = Date.now()-response.sent_ms;
+      const rtt = roomNow()-response.sent_ms;
       if (rtt >= 0 && rtt < 10000) {
         state.clockSamples.push({rtt,skew:response.server_ms-(response.sent_ms+rtt/2)});
         if(state.clockSamples.length>12)state.clockSamples.shift();
@@ -572,7 +574,7 @@ function leaveRoom() {
   renderRoom();
 }
 function pingRoom() {
-  if (room?.connected && room.socket.readyState === WebSocket.OPEN) room.socket.send(JSON.stringify({type:"ping",sent_ms:Date.now()}));
+  if (room?.connected && room.socket.readyState === WebSocket.OPEN) room.socket.send(JSON.stringify({type:"ping",sent_ms:Math.round(roomNow())}));
 }
 function publish(paused=false) {
   if (!room?.host || !room.connected || room.socket.readyState !== WebSocket.OPEN) return;
@@ -581,7 +583,7 @@ function publish(paused=false) {
     type:"playback",track_id:direct ? selected.id : null,
     position_ms:direct ? Math.round(Math.max(0,audio.currentTime || 0)*1000) : 0,
     playing:Boolean(direct && !audio.paused && !audio.ended && !audio.seeking && audio.readyState>=3 && !paused),rate:audio.playbackRate,
-    sampled_at_ms:Math.round(Date.now()+room.skew)
+    sampled_at_ms:Math.round(roomNow()+room.skew)
   }));
 }
 function publishSoon() {
@@ -627,7 +629,7 @@ async function applyRemote(state,playback) {
 function syncRoom() {
   if (!isGuest() || !room.connected || !room.desired || selected?.id !== room.desired.track_id) return;
   const target = room.desired;
-  const position = (target.position_ms+(target.playing ? Math.max(0,Date.now()+room.skew-target.at_ms)*target.rate : 0))/1000;
+  const position = (target.position_ms+(target.playing ? Math.max(0,roomNow()+room.skew-target.at_ms)*target.rate : 0))/1000;
   if(!Number.isFinite(audio.duration)||audio.seeking)return;
   const next=Math.min(Math.max(0,position),audio.duration);
   const drift=next-audio.currentTime;
@@ -644,7 +646,8 @@ function syncRoom() {
 function enableRoomSound() {
   if (!isGuest()) return;
   room.sound = true;
-  if (room.desired?.playing) requestPlay();
+  // Keep the user gesture for WebAudio, but never start a stale or unaligned track.
+  startAudioGraph();
   syncRoom();
   renderRoom();
 }
@@ -676,7 +679,7 @@ audio.addEventListener("canplay",()=>{syncRoom();publishSoon();});
 audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
 audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); stopLyricAnim(); });
 audio.addEventListener("seeking",() => { meter = null; });
-audio.addEventListener("seeked",()=>{publishSoon();syncLyrics(true);paintLyricWords();});
+audio.addEventListener("seeked",()=>{publishSoon();syncRoom();syncLyrics(true);paintLyricWords();});
 audio.addEventListener("ended",() => {
   stopLyricAnim();
   finalizeListen();
