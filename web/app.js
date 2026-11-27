@@ -482,25 +482,37 @@ async function joinRoom(raw) {
   clearVideo();
   const address = new URL("/ws/room/"+code,location.href);
   address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(address);
-  const state = {code,socket,host:null,sound:false,desired:null,skew:0,rtt:Infinity,clockSamples:[],loading:null,trackRequest:0,timer:null};
+  const state = {code,address,socket:null,host:null,sound:false,desired:null,skew:0,rtt:Infinity,clockSamples:[],loading:null,trackRequest:0,timer:null,retryTimer:null,retries:0,connected:false};
   room = state;
   text("roomStatus","Подключаемся…");
+  connectRoom(state);
+}
+function connectRoom(state) {
+  if(room!==state)return;
+  const socket = new WebSocket(state.address);
+  state.socket=socket;
+  state.connected=false;
+  state.clockSamples=[];
+  state.rtt=Infinity;
+  const active=()=>room===state&&state.socket===socket;
   socket.addEventListener("open",() => {
-    if (room === state) socket.send(JSON.stringify({type:"join",token}));
+    if (active()) socket.send(JSON.stringify({type:"join",token}));
   });
   socket.addEventListener("message",event => {
-    if (room !== state) return;
+    if (!active()) return;
     let response;
     try { response = JSON.parse(event.data); } catch { return; }
     if (response.type === "joined") {
       state.host = response.host;
+      state.connected=true;
+      state.retries=0;
+      state.desired=null;
       state.skew = response.server_ms-Date.now();
       if (state.host) publish();
       else { audio.pause(); applyRemote(state,response.playback); }
       pingRoom();
       renderRoom();
-    } else if (response.type === "playback" && !state.host) {
+    } else if (response.type === "playback" && state.connected && state.host===false) {
       applyRemote(state,response.playback);
     } else if (response.type === "pong") {
       const rtt = Date.now()-response.sent_ms;
@@ -516,11 +528,22 @@ async function joinRoom(raw) {
     }
   });
   socket.addEventListener("close",() => {
-    if (room !== state) return;
+    if (!active()) return;
+    state.connected=false;
+    state.desired=null;
+    state.loading=null;
+    state.trackRequest++;
+    clearTimeout(state.timer);
     if (state.host === false) audio.pause();
-    room = null;
     audio.playbackRate = rate;
-    renderRoom(state.host === null ? "Комната недоступна. Проверь код." : "Соединение потеряно. Войди по тому же коду.");
+    if(state.host===null||state.retries>=6){
+      room=null;
+      renderRoom(state.host===null?"Комната недоступна. Проверь код.":"Не удалось восстановить комнату. Войди по тому же коду.");
+      return;
+    }
+    const delay=Math.min(8000,500*2**state.retries++);
+    renderRoom("Связь потеряна. Переподключаемся…");
+    state.retryTimer=setTimeout(()=>connectRoom(state),delay);
   });
 }
 function renderRoom(message) {
@@ -538,15 +561,16 @@ function leaveRoom() {
   else if (old.host === false) audio.pause();
   room = null;
   clearTimeout(old.timer);
-  old.socket.close();
+  clearTimeout(old.retryTimer);
+  old.socket?.close();
   audio.playbackRate = rate;
   renderRoom();
 }
 function pingRoom() {
-  if (room?.socket.readyState === WebSocket.OPEN) room.socket.send(JSON.stringify({type:"ping",sent_ms:Date.now()}));
+  if (room?.connected && room.socket.readyState === WebSocket.OPEN) room.socket.send(JSON.stringify({type:"ping",sent_ms:Date.now()}));
 }
 function publish(paused=false) {
-  if (!room?.host || room.socket.readyState !== WebSocket.OPEN) return;
+  if (!room?.host || !room.connected || room.socket.readyState !== WebSocket.OPEN) return;
   const direct = selected && selected.kind !== "youtube";
   room.socket.send(JSON.stringify({
     type:"playback",track_id:direct ? selected.id : null,
@@ -564,8 +588,21 @@ function publishSoon() {
 async function applyRemote(state,playback) {
   if (state.desired && playback.revision < state.desired.revision) return;
   state.desired = playback;
-  if (!playback.track_id) { audio.pause(); return; }
-  if (selected?.id === playback.track_id) { syncRoom(); return; }
+  if (!playback.track_id) {
+    state.trackRequest++;
+    state.loading=null;
+    audio.pause();
+    return;
+  }
+  if (selected?.id === playback.track_id) {
+    if(state.loading&&state.loading!==playback.track_id){
+      state.trackRequest++;
+      state.loading=null;
+    }
+    syncRoom(); return;
+  }
+  // Never keep playing the previous song while metadata for the new one loads.
+  audio.pause();
   if (state.loading === playback.track_id) return;
   state.loading = playback.track_id;
   const request = ++state.trackRequest;
@@ -583,7 +620,7 @@ async function applyRemote(state,playback) {
   }
 }
 function syncRoom() {
-  if (!isGuest() || !room.desired || selected?.id !== room.desired.track_id) return;
+  if (!isGuest() || !room.connected || !room.desired || selected?.id !== room.desired.track_id) return;
   const target = room.desired;
   const position = (target.position_ms+(target.playing ? Math.max(0,Date.now()+room.skew-target.at_ms)*target.rate : 0))/1000;
   if(!Number.isFinite(audio.duration)||audio.seeking)return;
