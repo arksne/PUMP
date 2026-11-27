@@ -637,6 +637,40 @@ class PlayerTest(unittest.TestCase):
             self.assertEqual(errors, [])
             browser.close()
 
+    def test_lyrics_overlapping_vocals_and_gaps(self):
+        doc={"format":"ttml","lines":[
+            {"text":"lead","start_ms":1000,"end_ms":4000,
+             "words":[{"text":"lead","start_ms":1000,"end_ms":4000}],"singer_ids":["lead"],"alignment":"left"},
+            {"text":"harmony","start_ms":2000,"end_ms":3000,
+             "words":[{"text":"harmony","start_ms":2000,"end_ms":3000}],"singer_ids":["harmony"],"alignment":"right"},
+            {"text":"outro","start_ms":6000,"end_ms":8000,
+             "words":[{"text":"outro","start_ms":6000,"end_ms":8000}],"singer_ids":["lead"],"alignment":"left"}]}
+        with sync_playwright() as driver:
+            executable=os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
+            browser=driver.chromium.launch(executable_path=executable)
+            page=browser.new_page(viewport={"width":390,"height":844})
+            errors=[]
+            page.on("pageerror",lambda error:errors.append(str(error)))
+            page.route("**/api/lyrics/**",lambda route:route.fulfill(json={"plain":None,"document":doc}))
+            page.goto(self.origin)
+            page.locator("#tabSearch").click()
+            page.locator("#source").select_option("full")
+            page.locator("#qInput").fill("North")
+            page.get_by_role("button",name="North Loop",exact=False).click()
+            wait_for_audio(page,"audio => audio.currentTime > 0.6")
+            page.locator("#tabLyrics").click()
+            page.locator("#audio").evaluate("(audio) => { audio.pause(); audio.currentTime=2.5; }")
+            expect(page.locator(".l-line.active")).to_have_count(2)
+            expect(page.locator(".lyric-word.current")).to_have_count(2)
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime=5; }")
+            expect(page.locator(".l-line.active")).to_have_count(0)
+            expect(page.locator(".lyric-word.current")).to_have_count(0)
+            page.locator("#audio").evaluate("(audio) => { audio.currentTime=1.5; }")
+            expect(page.locator(".lyric-word.current")).to_have_text("lead")
+            expect(page.locator(".lyric-word.sung")).to_have_count(0)
+            self.assertEqual(errors,[])
+            browser.close()
+
     def test_two_people_listen_together(self):
         with sync_playwright() as driver:
             executable = os.environ.get("PUMP_TEST_CHROMIUM") or shutil.which("chromium")
