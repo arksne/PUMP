@@ -341,9 +341,18 @@ mod tests {
 
     #[test]
     fn scheduled_start_is_bounded_and_only_used_for_playing() {
-        assert_eq!(playback_anchor(10_000, true, Some(9_900), Some(11_200)), 11_200);
-        assert_eq!(playback_anchor(10_000, true, Some(9_900), Some(15_000)), 9_900);
-        assert_eq!(playback_anchor(10_000, false, Some(9_900), Some(11_200)), 9_900);
+        assert_eq!(
+            playback_anchor(10_000, true, Some(9_900), Some(11_200)),
+            11_200
+        );
+        assert_eq!(
+            playback_anchor(10_000, true, Some(9_900), Some(15_000)),
+            9_900
+        );
+        assert_eq!(
+            playback_anchor(10_000, false, Some(9_900), Some(11_200)),
+            9_900
+        );
         assert_eq!(playback_anchor(10_000, true, Some(99_000), None), 10_000);
         assert_eq!(playback_anchor(10_000, true, Some(4_000), None), 10_000);
     }
