@@ -118,6 +118,7 @@ pub struct Lyrics {
 
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(180);
 static REMOTE_SEARCH_SLOTS: Semaphore = Semaphore::const_new(24);
+static REMOTE_LOOKUP_SLOTS: Semaphore = Semaphore::const_new(16);
 type SearchCache = HashMap<(u8, String), (Instant, Vec<Track>)>;
 type LookupCache = HashMap<String, (Instant, Track)>;
 
@@ -425,12 +426,14 @@ impl Catalog {
         if let Some(video) = id.strip_prefix("yt-").filter(|id| valid_video(id)) {
             return Some(youtube_track(video, "Видео YouTube", ""));
         }
-        if let Some(audius_id) = id.strip_prefix("au-") {
+        if let Some(audius_id) = id.strip_prefix("au-").filter(|id| audius::valid_id(id)) {
+            let _permit = REMOTE_LOOKUP_SLOTS.try_acquire().ok()?;
             let track = self.audius.track(audius_id).await.ok()?;
             let _ = self.register_track(track.clone()).await;
             return Some(track);
         }
         if let Some(numeric) = id.strip_prefix("sc-").filter(|n| soundcloud::valid_id(n)) {
+            let _permit = REMOTE_LOOKUP_SLOTS.try_acquire().ok()?;
             // Комнаты и статистика принимают трек без предварительного поиска:
             // метаданные подтягиваются с источника и живут в lookup-кэше 6 часов.
             if let Ok(meta) = self.soundcloud.track(numeric).await
