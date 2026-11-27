@@ -1,13 +1,24 @@
 "use strict";
 
 const node = id => document.getElementById(id);
-const audio = node("audio"), seek = node("seekBar"), cover = node("cover"), frame = node("videoFrame");
+let audio=node("audio");
+const seek=node("seekBar"),cover=node("cover"),frame=node("videoFrame");
+const standbyDeck=document.createElement("audio");
+standbyDeck.id="audioStandby";standbyDeck.preload="metadata";
+audio.after(standbyDeck);
+const decks=[audio,standbyDeck];
+for(const deck of decks)deck.preservesPitch=true;
+function onActiveAudio(type,handler){for(const deck of decks)deck.addEventListener(type,event=>{if(deck===audio)handler(event);});}
 const tabs = {player:["scrPlayer","tabPlayer"], search:["scrSearch","tabSearch"], lyrics:["scrLyrics","tabLyrics"], rooms:["scrRooms","tabRooms"], stats:["scrStats","tabStats"]};
 const styles = ["card", "vinyl", "clover", "classic-glass", "full-bleed"];
 const labels = {full:"Полная запись", preview:"Превью", youtube:"Видео"};
 const known = new Map();
 let results = [], queue = [], selected = null, index = -1, currentTab = "player";
 let style = 0, shuffle = false, repeat = false, rate = 1, sleep = null;
+let crossfadeSeconds=Number(stored("pump.crossfadeSeconds",0));
+if(![0,2,4,6,8].includes(crossfadeSeconds))crossfadeSeconds=0;
+let automixEnabled=stored("pump.automixEnabled",false)===true;
+let transition=null,transitionFailed=null;
 let mountedVideo = null, lyricLines = [], lyricIndex = -1, lyricRequest = null;
 let lyricLineEnds=[],lyricLineMaxEnds=[],lyricLineActive=new Set();
 let searchRequest = null, searchTimer = null, statsSeq = 0;
@@ -180,12 +191,13 @@ function clearVideo() {
   mountedVideo = null;
   node("artBox").classList.remove("video");
 }
-function selectTrack(track, remote=false) {
+function selectTrack(track, remote=false, prepared=false) {
   if (!track || (!remote && isGuest())) return;
   if(room?.host)cancelHostStart(room);
+  if(!prepared)cancelCrossfade();
+  transitionFailed=null;
   finalizeListen();
-  audio.pause();
-  audio.removeAttribute("src");
+  if(!prepared){audio.pause();audio.removeAttribute("src");}
   clearVideo();
   streamSelection++;streamCandidates=[];
   providerSelection++;
@@ -211,12 +223,12 @@ function selectTrack(track, remote=false) {
   node("bg").style.backgroundImage = image ? "url(" + JSON.stringify(image) + ")" : "none";
   node("attribution").hidden = !track.attribution;
   const url = asset(track.audio_url);
-  if (track.kind !== "youtube" && url) {
+  if (!prepared&&track.kind !== "youtube" && url) {
     audio.src = track.kind === "preview" && track.source === "iTunes" ? "/preview/"+encodeURIComponent(track.id) : url;
     audio.playbackRate = rate;
   }
-  if(track.offlineBlob){const blobUrl=URL.createObjectURL(track.offlineBlob);audio.src=blobUrl;audio.addEventListener("emptied",()=>URL.revokeObjectURL(blobUrl),{once:true});}
-  audio.load();
+  if(!prepared&&track.offlineBlob){const blobUrl=URL.createObjectURL(track.offlineBlob);audio.src=blobUrl;audio.addEventListener("emptied",()=>URL.revokeObjectURL(blobUrl),{once:true});}
+  if(!prepared)audio.load();
   updateButtons();
   if (node("queueSheet").open) renderQueue();
   if(localOnly){
@@ -315,12 +327,14 @@ function like() {
   updateButtons();
 }
 function setRate(value, button) {
+  cancelCrossfade();
   rate = Number(value);
   audio.playbackRate = rate;
   document.querySelectorAll("[data-action=rate]").forEach(item => item.classList.toggle("active",button === item));
   publishSoon();
 }
 function toggleSleep() {
+  cancelCrossfade();
   if (sleep) { clearInterval(sleep); sleep = null; audio.volume = 1; }
   else {
     const deadline = Date.now()+Number(node("sleepDuration").value)*60000;
@@ -516,6 +530,7 @@ async function joinRoom(raw) {
   const code = raw.trim().toLowerCase();
   if (!/^[0-9a-f]{12}$/.test(code)) throw new Error("Введи 12 символов кода комнаты.");
   await session();
+  cancelCrossfade();
   leaveRoom();
   clearVideo();
   const address = new URL("/ws/room/"+code,location.href);
@@ -744,15 +759,17 @@ node("joinRoom").addEventListener("submit",event => {
 seek.addEventListener("input",() => {
   if (!isGuest() && Number.isFinite(audio.duration)) audio.currentTime = Number(seek.value)/100*audio.duration;
 });
-audio.addEventListener("timeupdate",() => { updateTimeline(); syncLyrics(); sampleListening(); });
-audio.addEventListener("loadedmetadata",() => { updateTimeline(); updateButtons(); syncRoom(); });
-audio.addEventListener("waiting",publishSoon);
-audio.addEventListener("canplay",()=>{syncRoom();publishSoon();});
-audio.addEventListener("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
-audio.addEventListener("pause",() => { meter = null; finalizeListen(); updateButtons(); publishSoon(); stopLyricAnim(); });
-audio.addEventListener("seeking",() => { meter = null; });
-audio.addEventListener("seeked",()=>{publishSoon();syncRoom();syncLyrics(true);paintLyricWords();});
-audio.addEventListener("ended",() => {
+onActiveAudio("timeupdate",() => { updateTimeline(); syncLyrics(); sampleListening(); maybeCrossfade(); });
+onActiveAudio("loadedmetadata",() => { updateTimeline(); updateButtons(); syncRoom(); });
+onActiveAudio("waiting",()=>{cancelCrossfade();publishSoon();});
+onActiveAudio("canplay",()=>{syncRoom();publishSoon();});
+onActiveAudio("playing",() => { text("playerStatus",""); updateButtons(); publishSoon(); refreshLyricAnim(); });
+onActiveAudio("pause",() => { if(!audio.ended)cancelCrossfade();meter=null;finalizeListen();updateButtons();publishSoon();stopLyricAnim(); });
+onActiveAudio("seeking",() => { cancelCrossfade();meter=null; });
+onActiveAudio("seeked",()=>{publishSoon();syncRoom();syncLyrics(true);paintLyricWords();});
+onActiveAudio("ended",() => {
+  if(transition?.phase==="fading"&&finishCrossfade(transition))return;
+  cancelCrossfade();
   stopLyricAnim();
   finalizeListen();
   if (isGuest()) return;
@@ -760,7 +777,8 @@ audio.addEventListener("ended",() => {
   else if (queue.length > 1) step(1);
   else { updateButtons(); publishSoon(); }
 });
-audio.addEventListener("error",() => {
+onActiveAudio("error",() => {
+  cancelCrossfade();
   if(selected?.provider && !selected.offlineBlob){recoverProviderTrack().catch(error=>text("playerStatus",error.message));return;}
   if (selected?.kind !== "youtube" && audio.getAttribute("src")) text("playerStatus","Аудиофайл недоступен.");
 });
@@ -779,8 +797,8 @@ document.addEventListener("click",event => {
     case "previous": step(-1); break;
     case "next": step(1); break;
     case "like": like(); break;
-    case "shuffle": shuffle = !shuffle; pressed("shufBtn",shuffle,"active"); break;
-    case "repeat": repeat = !repeat; pressed("repBtn",repeat,"active"); break;
+    case "shuffle": cancelCrossfade();shuffle = !shuffle; pressed("shufBtn",shuffle,"active"); break;
+    case "repeat": cancelCrossfade();repeat = !repeat; pressed("repBtn",repeat,"active"); break;
     case "style": {
       const box = node("artBox");
       box.classList.remove(styles[style]);
@@ -832,18 +850,124 @@ if (!Array.isArray(eqGains)||eqGains.length!==10) eqGains=Array(10).fill(0);
 function startAudioGraph() {
   if (!graph && window.AudioContext && (!audio.src || audio.src.startsWith("blob:") || new URL(audio.src).origin === location.origin)) {
     const context=new AudioContext();
-    const source=context.createMediaElementSource(audio);
+    const source=context.createGain();
+    const deckGains=new Map();
+    for(const deck of decks){
+      const input=context.createMediaElementSource(deck),gain=context.createGain();
+      gain.gain.value=deck===audio?1:0;
+      input.connect(gain);gain.connect(source);deckGains.set(deck,gain);
+    }
     const preamp=context.createGain();
     let tail=source;
     const filters=PumpUX.frequencies.map(f=>{
       const filter=context.createBiquadFilter();filter.type="peaking";filter.frequency.value=Math.min(f,context.sampleRate*.45);filter.Q.value=1.4;
       tail.connect(filter);tail=filter;return filter;
     });
-    tail.connect(preamp);preamp.connect(context.destination);graph={context,source,filters,preamp,rustDsp:null};applyEq();graph.ready=attachRustDsp(graph);
+    tail.connect(preamp);preamp.connect(context.destination);graph={context,source,deckGains,filters,preamp,rustDsp:null};applyEq();graph.ready=attachRustDsp(graph);
     if(audio.sinkId&&typeof context.setSinkId==="function")context.setSinkId(audio.sinkId).catch(error=>text("outputStatus",error.message));
   }
   graph?.context.resume().catch(()=>{});
 }
+// Two media decks share the same WebAudio DSP chain. The active DOM id
+// follows the audible deck; the incoming deck is not reloaded at handoff.
+function deckGain(deck,value){
+  const gain=graph?.deckGains.get(deck)?.gain;
+  if(!gain)return;
+  const now=graph.context.currentTime;
+  gain.cancelScheduledValues(now);gain.setValueAtTime(value,now);
+}
+function stopDeck(deck){
+  deckGain(deck,0);deck.pause();deck.removeAttribute("src");deck.load();
+}
+function cancelCrossfade(){
+  const state=transition;
+  if(!state)return;
+  transition=null;clearTimeout(state.timer);
+  deckGain(audio,1);
+  if(state.to!==audio)stopDeck(state.to);
+}
+function directMixUrl(track){
+  if(!track||track.kind!=="full"||track.provider||track.offlineBlob||!track.audio_url)return null;
+  const url=asset(track.audio_url);
+  return url&&new URL(url).origin===location.origin?url:null;
+}
+function mixCandidate(){
+  if(!graph||graph.context.state!=="running"||room||sleep||repeat||shuffle||localOnly||!selected||!directMixUrl(selected)||queue.length<2||index<0)return null;
+  const nextIndex=(index+1)%queue.length,track=queue[nextIndex],url=directMixUrl(track);
+  if(!url||track.id===selected.id)return null;
+  return {track,nextIndex,url,key:selected.id+"|"+track.id};
+}
+function maybeCrossfade(){
+  const seconds=crossfadeSeconds;
+  if(seconds<=0||audio.paused||audio.seeking||!Number.isFinite(audio.duration)){cancelCrossfade();return;}
+  const candidate=mixCandidate();
+  if(!candidate||candidate.key===transitionFailed){cancelCrossfade();return;}
+  const remaining=(audio.duration-audio.currentTime)/audio.playbackRate;
+  if(transition&&transition.key!==candidate.key)cancelCrossfade();
+  if(!transition&&remaining<=seconds+8&&remaining>0.25){
+    const to=decks.find(deck=>deck!==audio);
+    const state={...candidate,from:audio,to,phase:"preload",timer:null};
+    transition=state;deckGain(to,0);
+    to.preload="auto";to.src=candidate.url;to.playbackRate=rate;to.volume=audio.volume;to.load();
+  }
+  const state=transition;
+  if(!state)return;
+  if(state.phase==="fading"){
+    if(graph.context.currentTime>=state.endAt)finishCrossfade(state);
+    return;
+  }
+  if(state.phase!=="preload"||remaining>seconds||state.to.readyState<2)return;
+  state.phase="starting";
+  state.to.play().then(()=>{
+    if(transition!==state)return;
+    if(audio.paused||audio.seeking||room||state.from!==audio){cancelCrossfade();return;}
+    const duration=Math.min(seconds,(audio.duration-audio.currentTime)/audio.playbackRate);
+    if(duration<0.15){transitionFailed=state.key;cancelCrossfade();return;}
+    const now=graph.context.currentTime;
+    const out=graph.deckGains.get(state.from).gain,inc=graph.deckGains.get(state.to).gain;
+    // Equal-power shape with peak-safe shared headroom.
+    const a=new Float32Array(65),b=new Float32Array(65);
+    for(let i=0;i<a.length;i++){
+      const theta=i/(a.length-1)*Math.PI/2,x=Math.cos(theta),y=Math.sin(theta),headroom=Math.max(1,x+y);
+      a[i]=x/headroom;b[i]=y/headroom;
+    }
+    out.cancelScheduledValues(now);inc.cancelScheduledValues(now);
+    out.setValueCurveAtTime(a,now,duration);inc.setValueCurveAtTime(b,now,duration);
+    state.phase="fading";state.endAt=now+duration;
+    state.timer=setTimeout(()=>finishCrossfade(state),duration*1000+25);
+  }).catch(()=>{if(transition===state){transitionFailed=state.key;cancelCrossfade();}});
+}
+function finishCrossfade(state){
+  if(transition!==state||state.phase!=="fading")return false;
+  if(state.to.paused||state.to.ended||state.to.readyState<2){transitionFailed=state.key;cancelCrossfade();return false;}
+  if(!state.from.ended&&graph.context.currentTime+0.05<state.endAt){
+    clearTimeout(state.timer);state.timer=setTimeout(()=>finishCrossfade(state),100);return false;
+  }
+  transition=null;clearTimeout(state.timer);
+  finalizeListen();
+  const previous=audio;
+  previous.id="audioStandby";audio=state.to;audio.id="audio";
+  deckGain(audio,1);stopDeck(previous);
+  index=state.nextIndex;selectTrack(state.track,false,true);
+  updateTimeline();updateButtons();rememberPlayingTrack();refreshLyricAnim();
+  return true;
+}
+for(const deck of decks){
+  deck.addEventListener("canplay",()=>{if(transition?.to===deck)maybeCrossfade();});
+  for(const event of ["error","ended","waiting"])deck.addEventListener(event,()=>{
+    if(transition?.to!==deck)return;
+    if(event==="waiting"&&transition.phase==="preload")return;
+    transitionFailed=transition.key;cancelCrossfade();
+  });
+}
+node("crossfadeSeconds").value=String(crossfadeSeconds);
+node("crossfadeSeconds").addEventListener("change",()=>{
+  cancelCrossfade();crossfadeSeconds=Number(node("crossfadeSeconds").value);persist("pump.crossfadeSeconds",crossfadeSeconds);
+});
+node("automixEnabled").checked=automixEnabled;
+node("automixEnabled").addEventListener("change",()=>{
+  automixEnabled=node("automixEnabled").checked;persist("pump.automixEnabled",automixEnabled);
+});
 function applyEq() {
   if (!graph) return;
   const enabled=node("eqEnabled").checked;
@@ -924,10 +1048,11 @@ document.addEventListener("click",async event=>{
   if(action==="show-history"){results=stored("pump.history",[]);renderResults("История прослушиваний");settings(false);goTab("search");}
  }catch(error){text("settingsStatus",error.message);text("offlineStatus",error.message);}
 });
-audio.addEventListener("playing",()=>{
- if(!selected)return;const history=stored("pump.history",[]).filter(track=>track.id!==selected.id);history.unshift(selected);persist("pump.history",history.slice(0,100));
+function rememberPlayingTrack(){
+ if(!selected)return;const history=stored("pump.history",[]).filter(track=>track.id!==selected.id);history.unshift(PumpUX.trackMetadata(selected));persist("pump.history",history.slice(0,100));
  if(navigator.mediaSession){navigator.mediaSession.metadata=new MediaMetadata({title:selected.title,artist:selected.artist,artwork:asset(selected.artwork)?[{src:asset(selected.artwork)}]:[]});}
-});
+}
+onActiveAudio("playing",rememberPlayingTrack);
 if(navigator.mediaSession){for(const [action,handler] of Object.entries({play:()=>requestPlay(),pause:()=>audio.pause(),nexttrack:()=>step(1),previoustrack:()=>step(-1),seekto:event=>{if(!isGuest()&&event)audio.currentTime=event.seekTime;}})){try{navigator.mediaSession.setActionHandler(action,event=>{if(!isGuest())handler(event);});}catch{}}}
 function connectControls(){
  if(localOnly)return;
@@ -957,7 +1082,7 @@ function playStreamCandidate(){
  target.play().then(()=>text("playerStatus","")).catch(error=>{if(error.name!=="AbortError")text("playerStatus","Нажми Play, чтобы начать воспроизведение.");});
 }
 function fallbackStream(){if(selected?.kind!=="youtube")return;if(++streamIndex<streamCandidates.length){playStreamCandidate();}else{text("playerStatus","Доступные форматы закончились. Можно открыть YouTube.");streamCandidates=[];}}
-audio.addEventListener("error",fallbackStream);streamVideo.addEventListener("error",fallbackStream);
+onActiveAudio("error",fallbackStream);streamVideo.addEventListener("error",fallbackStream);
 node("streamMode").addEventListener("change",()=>{streamCandidates=[];audio.pause();streamVideo.pause();loadStreams();});
 document.addEventListener("visibilitychange",() => { refreshLyricAnim(); });
 document.addEventListener("click",event=>{if(event.target.closest('[data-action="youtube-embed"]')&&selected?.video_id){audio.pause();streamVideo.pause();streamVideo.hidden=true;frame.src="https://www.youtube-nocookie.com/embed/"+selected.video_id+"?autoplay=1";frame.hidden=false;mountedVideo=selected.id;node("artBox").classList.add("video");updateButtons();}});
@@ -1036,7 +1161,7 @@ function tickLyricWords(){
 }
 
 node("localOnly").checked=localOnly;
-node("localOnly").addEventListener("change",()=>{localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
+node("localOnly").addEventListener("change",()=>{cancelCrossfade();localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
 
 let canvasUrl=null;
 node("canvasFile").addEventListener("change",async event=>{try{const file=event.target.files[0];if(!file)return;if(!["video/mp4","video/webm"].includes(file.type)||file.size>32*1024*1024)throw new Error("Для Canvas нужен MP4/WebM до 32 МБ.");if(canvasUrl)URL.revokeObjectURL(canvasUrl);canvasUrl=URL.createObjectURL(file);const video=node("canvasVideo");video.src=canvasUrl;video.hidden=false;await video.play();}catch(error){text("settingsStatus",error.message);}});
@@ -1115,8 +1240,7 @@ async function attachRustDsp(current){
 }
 node("concertMode").addEventListener("change",()=>{startAudioGraph();applyEq();});
 node("pitchSemitones").addEventListener("input",()=>{text("pitchValue",node("pitchSemitones").value+" полутонов");applyEq();});
-audio.preservesPitch=true;
-audio.addEventListener("emptied",()=>graph?.rustDsp?.reset().catch(()=>{}));
+onActiveAudio("emptied",()=>graph?.rustDsp?.reset().catch(()=>{}));
 
 
 // Каждое разрешение создаёт отдельные ссылки. Перемотка не смешивает байты разных форматов.
