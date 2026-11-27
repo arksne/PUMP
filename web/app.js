@@ -533,7 +533,7 @@ async function joinRoom(raw) {
   const code = raw.trim().toLowerCase();
   if (!/^[0-9a-f]{12}$/.test(code)) throw new Error("Введи 12 символов кода комнаты.");
   await session();
-  cancelCrossfade();stopRateRamp();
+  cancelCrossfade();stopRateRamp();analysisRequest?.abort();deckGain(audio,1);
   leaveRoom();
   clearVideo();
   const address = new URL("/ws/room/"+code,location.href);
@@ -855,10 +855,15 @@ function startAudioGraph() {
     const context=new AudioContext();
     const source=context.createGain();
     const deckGains=new Map();
-    for(const deck of decks){
-      const input=context.createMediaElementSource(deck),gain=context.createGain();
-      gain.gain.value=deck===audio?analysisGain(selected):0;
-      input.connect(gain);gain.connect(source);deckGains.set(deck,gain);
+    for(const deck of [audio,...decks.filter(item=>item!==audio)]){
+      try{
+        const input=context.createMediaElementSource(deck),gain=context.createGain();
+        gain.gain.value=deck===audio?analysisGain(selected):0;
+        input.connect(gain);gain.connect(source);deckGains.set(deck,gain);
+      }catch(error){
+        if(deck===audio){context.close().catch(()=>{});text("dspStatus",error.message);return;}
+        text("dspStatus","Второй аудиодек недоступен в этом браузере.");
+      }
     }
     const preamp=context.createGain();
     let tail=source;
@@ -943,7 +948,7 @@ function deckGain(deck,value){
   const gain=graph?.deckGains.get(deck)?.gain;
   if(!gain)return;
   const now=graph.context.currentTime;
-  gain.cancelScheduledValues(now);gain.setValueAtTime(value,now);
+  gain.cancelScheduledValues(0);gain.setValueAtTime(value,now);
 }
 function stopDeck(deck){
   deckGain(deck,0);deck.pause();deck.removeAttribute("src");deck.load();
@@ -961,7 +966,7 @@ function directMixUrl(track){
   return url&&new URL(url).origin===location.origin?url:null;
 }
 function mixCandidate(){
-  if(!graph||graph.context.state!=="running"||room||sleep||repeat||shuffle||localOnly||!selected||!directMixUrl(selected)||queue.length<2||index<0)return null;
+  if(!graph||graph.deckGains.size!==2||graph.context.state!=="running"||room||sleep||repeat||shuffle||localOnly||!selected||!directMixUrl(selected)||queue.length<2||index<0)return null;
   const nextIndex=(index+1)%queue.length,track=queue[nextIndex],url=directMixUrl(track);
   if(!url||track.id===selected.id)return null;
   const auto=automixEnabled&&localMixTrack(selected)&&localMixTrack(track);
@@ -990,6 +995,7 @@ function mixCandidate(){
   return {track,nextIndex,url,key:selected.id+"|"+track.id,seconds,cue,incomingRate};
 }
 function maybeCrossfade(){
+  if(transition?.phase==="fading"&&audio.ended){finishCrossfade(transition);return;}
   if(audio.paused||audio.seeking||!Number.isFinite(audio.duration)){cancelCrossfade();return;}
   const candidate=mixCandidate();
   if(!candidate||candidate.key===transitionFailed){cancelCrossfade();return;}
@@ -1028,7 +1034,7 @@ function maybeCrossfade(){
       const theta=i/(a.length-1)*Math.PI/2,x=Math.cos(theta),y=Math.sin(theta),headroom=Math.max(1,x+y);
       a[i]=x/headroom*analysisGain(selected);b[i]=y/headroom*analysisGain(state.track);
     }
-    out.cancelScheduledValues(now);inc.cancelScheduledValues(now);
+    out.cancelScheduledValues(0);inc.cancelScheduledValues(0);
     out.setValueCurveAtTime(a,now,duration);inc.setValueCurveAtTime(b,now,duration);
     state.phase="fading";state.endAt=now+duration;
     state.timer=setTimeout(()=>finishCrossfade(state),duration*1000+25);
@@ -1054,7 +1060,7 @@ for(const deck of decks){
   for(const event of ["loadedmetadata","canplay","seeked"])deck.addEventListener(event,()=>{if(transition?.to===deck)maybeCrossfade();});
   for(const event of ["error","ended","waiting"])deck.addEventListener(event,()=>{
     if(transition?.to!==deck)return;
-    if(event==="waiting"&&transition.phase==="preload")return;
+    if(event==="waiting"&&transition.phase!=="fading")return;
     transitionFailed=transition.key;cancelCrossfade();
   });
 }
@@ -1261,7 +1267,7 @@ function tickLyricWords(){
 }
 
 node("localOnly").checked=localOnly;
-node("localOnly").addEventListener("change",()=>{cancelCrossfade();localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
+node("localOnly").addEventListener("change",()=>{cancelCrossfade();stopRateRamp();analysisRequest?.abort();localOnly=node("localOnly").checked;persist("pump.localOnly",localOnly);if(localOnly){leaveRoom();remoteSocket?.close();audio.pause();audio.removeAttribute("src");audio.load();clearVideo();}else session().then(connectControls).catch(()=>{});search().catch(error=>text("settingsStatus",error.message));});
 
 let canvasUrl=null;
 node("canvasFile").addEventListener("change",async event=>{try{const file=event.target.files[0];if(!file)return;if(!["video/mp4","video/webm"].includes(file.type)||file.size>32*1024*1024)throw new Error("Для Canvas нужен MP4/WebM до 32 МБ.");if(canvasUrl)URL.revokeObjectURL(canvasUrl);canvasUrl=URL.createObjectURL(file);const video=node("canvasVideo");video.src=canvasUrl;video.hidden=false;await video.play();}catch(error){text("settingsStatus",error.message);}});
