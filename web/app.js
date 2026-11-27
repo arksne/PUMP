@@ -9,6 +9,7 @@ const known = new Map();
 let results = [], queue = [], selected = null, index = -1, currentTab = "player";
 let style = 0, shuffle = false, repeat = false, rate = 1, sleep = null;
 let mountedVideo = null, lyricLines = [], lyricIndex = -1, lyricRequest = null;
+let lyricLineEnds=[],lyricLineMaxEnds=[],lyricLineActive=new Set();
 let searchRequest = null, searchTimer = null, statsSeq = 0;
 let token = stored("pump.session", ""), pending = stored("pump.listens", []);
 let gettingSession = null, activeSession = null, sending = null, listening = null, meter = null;
@@ -219,8 +220,7 @@ function selectTrack(track, remote=false) {
   if (node("queueSheet").open) renderQueue();
   if(localOnly){
     lyricRequest?.abort();
-    lyricLines=[];lyricWords=[];lyricIndex=-1;
-    stopLyricAnim();
+    resetLyricState();
     node("lyricsBox").replaceChildren(element("p","plain-lyrics",track.offlineLyrics||"Текст не сохранён."));
   }else loadLyrics(track);
 }
@@ -343,7 +343,7 @@ function goTab(tab) {
     node(button).setAttribute("aria-current",tab === name ? "page" : "false");
   }
   if (tab === "stats") showStats();
-  if (tab === "lyrics") syncLyrics(true);
+  if (tab === "lyrics") {syncLyrics(true);paintLyricWords();}
   refreshLyricAnim();
   syncBack();
 }
@@ -352,15 +352,19 @@ async function loadLyrics(track) {
   lyricRequest?.abort();
   const request = new AbortController();
   lyricRequest = request;
-  lyricLines = [];
-  lyricIndex = -1;
-  lyricWords = [];
-  stopLyricAnim();
+  resetLyricState();
   const box = node("lyricsBox");
   box.replaceChildren(element("p","status","Загружаем текст…"));
   try {
     const data = await api("/api/lyrics/"+encodeURIComponent(track.id),{signal:request.signal});
     if (request.signal.aborted) return;
+    const plain=data.plain||data.document?.lines?.map(line=>line.text).join("\n")||"Текст не найден.";
+    // A preview begins at an unknown offset in the full recording.
+    // Never present full-song timestamps as synchronized preview lyrics.
+    if(track.kind==="preview"){
+      box.replaceChildren(element("p","status","Для превью доступен только обычный текст: начало фрагмента неизвестно."),element("p","plain-lyrics",plain));
+      return;
+    }
     if(data.document?.lines?.length) {
       lyricLines=data.document.lines.filter(line=>line.start_ms!=null).map(line=>({...line,time:line.start_ms/1000}));
     } else {
@@ -369,40 +373,63 @@ async function loadLyrics(track) {
         if(match)lyricLines.push({time:Number(match[1])*60+Number(match[2])+Number("0."+(match[3]||"0")),text:match[4]});
       }
     }
-    lyricLines.sort((a,b)=>a.time-b.time);box.replaceChildren();
-    lyricWords=[];
-    if(!lyricLines.length)box.append(element("p","plain-lyrics",data.plain||"Текст не найден."));
+    lyricLines=lyricLines.filter(line=>Number.isFinite(line.time)&&line.time>=0).sort((a,b)=>a.time-b.time);
+    box.replaceChildren();
+    prepareLyricLines();
+    if(!lyricLines.length)box.append(element("p","plain-lyrics",plain));
     else lyricLines.forEach((line,i)=>{
       const button=element("button","l-line");button.type="button";button.dataset.action="lyric";button.dataset.value=String(i);
       if(line.singer_ids?.length){button.append(element("span","lyric-singer",line.singer_ids.join(" · ")));button.dataset.singerSide=line.alignment==="right"||line.alignment==="end"?"right":"left";}
       if(line.words?.length)line.words.forEach((word,j)=>{
         const span=element("span","lyric-word",word.text);
         const start=Number(word.start_ms);
-        const next=line.words[j+1]?.start_ms??line.end_ms??Infinity;
+        const next=line.words[j+1]?.start_ms??lyricLineEnds[i]*1000;
         const end=word.end_ms==null?Number(next):Number(word.end_ms);
         button.append(span);
         if(Number.isFinite(start)&&end>=start)lyricWords.push({el:span,start,end});
       });
       else button.append(document.createTextNode(line.text));box.append(button);
     });
-    lyricWords.sort((a,b)=>a.start-b.start);
+    prepareLyricWords();
     paintLyricWords();
     syncLyrics();refreshLyricAnim();
   } catch (error) {
     if (!request.signal.aborted) box.replaceChildren(element("p","status",error.message));
   }
 }
+function resetLyricState(){
+  lyricLines=[];lyricLineEnds=[];lyricLineMaxEnds=[];lyricLineActive.clear();lyricIndex=-1;
+  lyricWords=[];lyricWordEvents=[];lyricWordCursor=0;
+  stopLyricAnim();
+}
+function prepareLyricLines(){
+  // Explicit ends are independent: two singers can overlap. Untimed LRC
+  // lines end at the next distinct start, not another simultaneous line.
+  let nextStart=Infinity;
+  lyricLineEnds=new Array(lyricLines.length);
+  for(let i=lyricLines.length-1;i>=0;i--){
+    const line=lyricLines[i];
+    if(i+1<lyricLines.length&&lyricLines[i+1].time>line.time)nextStart=lyricLines[i+1].time;
+    const explicit=line.end_ms==null?NaN:Number(line.end_ms)/1000;
+    lyricLineEnds[i]=Number.isFinite(explicit)&&explicit>=line.time?explicit:nextStart;
+  }
+  let max=0;
+  lyricLineMaxEnds=lyricLineEnds.map(end=>max=Math.max(max,end));
+}
 function syncLyrics(force=false) {
-  const t = audio.currentTime+lyricOffset()/1000;
+  if(!lyricLines.length)return;
+  const t=audio.currentTime+lyricOffset()/1000;
   let lo=0,hi=lyricLines.length;
   while(lo<hi){const mid=(lo+hi)>>1;if(lyricLines[mid].time<=t)lo=mid+1;else hi=mid;}
-  const next=lo-1;
-  if (next === lyricIndex && !force) return;
-  const children = node("lyricsBox").children;
-  children.item(lyricIndex)?.classList.remove("active");
-  children.item(next)?.classList.add("active");
-  if (currentTab === "lyrics") children.item(next)?.scrollIntoView({block:"nearest"});
-  lyricIndex = next;
+  const active=new Set();
+  for(let i=lo-1;i>=0&&lyricLineMaxEnds[i]>t;i--)if(lyricLineEnds[i]>t)active.add(i);
+  const children=node("lyricsBox").children;
+  for(const i of lyricLineActive)if(!active.has(i))children.item(i)?.classList.remove("active");
+  for(const i of active)if(!lyricLineActive.has(i))children.item(i)?.classList.add("active");
+  lyricLineActive=active;
+  const next=active.values().next().value??-1;
+  if((next!==lyricIndex||force)&&next>=0&&currentTab==="lyrics")children.item(next)?.scrollIntoView({block:"nearest"});
+  lyricIndex=next;
 }
 
 function sampleListening() {
@@ -891,7 +918,7 @@ document.addEventListener("visibilitychange",() => { refreshLyricAnim(); });
 document.addEventListener("click",event=>{if(event.target.closest('[data-action="youtube-embed"]')&&selected?.video_id){audio.pause();streamVideo.pause();streamVideo.hidden=true;frame.src="https://www.youtube-nocookie.com/embed/"+selected.video_id+"?autoplay=1";frame.hidden=false;mountedVideo=selected.id;node("artBox").classList.add("video");updateButtons();}});
 // Подсветка слов идёт только при видимом тексте и играющем аудио.
 // Слова кэшируются один раз при загрузке; каждый кадр трогает лишь окрестность текущей позиции.
-let lyricWords=[],lyricRaf=0;
+let lyricWords=[],lyricRaf=0,lyricWordEvents=[],lyricWordCursor=0;
 const savedLyricOffsets=stored("pump.lyricOffsets",[]);
 const lyricOffsets=new Map(Array.isArray(savedLyricOffsets)?savedLyricOffsets.filter(item=>Array.isArray(item)&&typeof item[0]==="string"&&Number.isFinite(item[1])&&Math.abs(item[1])<=10000).slice(-256):[]);
 const lyricOffsetControls=element("div","setting-row");
@@ -921,18 +948,33 @@ function lyricOffset(){return selected?lyricOffsets.get(selected.id)||0:0;}
 function refreshLyricOffset(){
   const offset=lyricOffset();
   lyricOffsetValue.textContent=(offset>0?"+":"")+offset+" мс";
+  lyricOffsetControls.hidden=!selected||selected.kind==="preview";
 }
 function lyricVisible(){return currentTab==="lyrics"||document.body.classList.contains("split-view");}
 function stopLyricAnim(){if(lyricRaf){cancelAnimationFrame(lyricRaf);lyricRaf=0;}}
 function refreshLyricAnim(){
-  if(!lyricWords.length||audio.paused||document.hidden||!lyricVisible()){stopLyricAnim();return;}
+  if(!lyricLines.length||audio.paused||document.hidden||!lyricVisible()){stopLyricAnim();return;}
   if(!lyricRaf)lyricRaf=requestAnimationFrame(tickLyricWords);
 }
-// Independent intervals preserve overlapping singers. Cache each rendered state
-// so unchanged words do not cause DOM writes on every animation frame.
+// Sorted time boundaries allow O(log n + changed events) updates.
+function prepareLyricWords(){
+  lyricWordEvents=[];
+  for(const word of lyricWords){
+    lyricWordEvents.push({at:word.start,word});
+    if(Number.isFinite(word.end))lyricWordEvents.push({at:word.end,word});
+  }
+  lyricWordEvents.sort((a,b)=>a.at-b.at);
+  lyricWordCursor=0;
+}
 function paintLyricWords(){
   const time=audio.currentTime*1000+lyricOffset();
-  for(const word of lyricWords){
+  let lo=0,hi=lyricWordEvents.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(lyricWordEvents[mid].at<=time)lo=mid+1;else hi=mid;}
+  if(lo===lyricWordCursor)return;
+  const changed=new Set();
+  for(let i=Math.min(lo,lyricWordCursor);i<Math.max(lo,lyricWordCursor);i++)changed.add(lyricWordEvents[i].word);
+  lyricWordCursor=lo;
+  for(const word of changed){
     const status=time<word.start?0:time<word.end?1:2;
     if(word.status===status)continue;
     word.status=status;
@@ -942,7 +984,7 @@ function paintLyricWords(){
 }
 function tickLyricWords(){
   lyricRaf=0;
-  if(audio.paused||document.hidden||!lyricWords.length||!lyricVisible())return;
+  if(audio.paused||document.hidden||!lyricLines.length||!lyricVisible())return;
   paintLyricWords();
   syncLyrics();
   lyricRaf=requestAnimationFrame(tickLyricWords);
